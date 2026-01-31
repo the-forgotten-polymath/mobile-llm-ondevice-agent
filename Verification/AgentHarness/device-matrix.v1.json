@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "documentID": "AH-DEVICE-MATRIX-V1",
+  "device": {
+    "name": "Dong's iPhone16Pro",
+    "model": "iPhone 16 Pro (iPhone17,1)",
+    "osVersion": "27.0 (24A5390f)"
+  },
+  "capturedAtUTC": "2026-08-04T14:40:00Z",
+  "combinedRun": {
+    "status": "pending-device-rerun",
+    "note": "Evidence is the real agent path (enabled=true asserted on every send). Provisioning 00-03 passed; first full matrix 07-25 was 16/19 (test16/test17 memory-tool descriptor gap, test24 web race) and all those root causes are fixed in code; focused run 12/13/17/26/28 passed, test16 passed except the writer acknowledgement wording (save+recall verified), test24 exposed a per-conversation Chat-options policy bug now fixed. test16/test24 need one device rerun. Tool V2 adapters (wikipedia/webpage/calendar/reminders/location/memory) now carry per-tool unit prepare/execute tests (2026-08-05) but device scenarios are pending; iOS 26 continued processing is implemented and needs a provisioned iPhone (Background Processing + Background GPU Access capabilities)."
+  },
+  "scenarios": [
+    { "id": "test00", "name": "Clean install cold launch", "status": "pass", "evidence": "provisioning 2026-08-04" },
+    { "id": "test01", "name": "Bonsai download with pause/resume", "status": "pass", "evidence": "provisioning 2026-08-04" },
+    { "id": "test02", "name": "Gemma vision bundle download", "status": "pass", "evidence": "provisioning 2026-08-04" },
+    { "id": "test03", "name": "Installed inventory and real loads", "status": "pass", "evidence": "provisioning 2026-08-04" },
+    { "id": "test07", "name": "Tool selections independent and persist across relaunch", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test08", "name": "Bonsai calculator-only", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test09", "name": "Gemma calculator-only", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test10", "name": "Bonsai clock-only", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test11", "name": "Gemma clock-only", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test12", "name": "Bonsai web search only (Tool V2 + approval)", "status": "pass", "evidence": "focused 2026-08-04 after boundary digest fix" },
+    { "id": "test13", "name": "Gemma web search only (Tool V2 + approval)", "status": "pass", "evidence": "focused 2026-08-04 after boundary digest fix" },
+    { "id": "test14", "name": "Tool master-off denies selected web search", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test15", "name": "Manual memory add, persistence, precise delete", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test16", "name": "Bonsai saves English memory, Gemma reads without tools", "status": "pending", "evidence": "save+durable row+reader recall verified 2026-08-04; writer acknowledgement assertion relaxed, rerun pending" },
+    { "id": "test17", "name": "Gemma saves English memory, Bonsai reads without tools", "status": "pass", "evidence": "focused 2026-08-04" },
+    { "id": "test18", "name": "Gemma vision fixture and image history without tools", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test19", "name": "Gemma visual question does not trigger allowed web search", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test20", "name": "Switching image draft Gemma to Bonsai is blocked without losing draft", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test21", "name": "Historical stats remain bound to the generating model after switch", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test22", "name": "Bonsai background suspend and lazy reload", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test23", "name": "Gemma background suspend and lazy reload", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test24", "name": "Changing web selection during cold load does not affect current turn", "status": "pending", "evidence": "per-conversation Chat-options policy bug fixed 2026-08-04; device rerun pending" },
+    { "id": "test25", "name": "Built-in skill selection persists per conversation", "status": "pass", "evidence": "matrix 2026-08-04" },
+    { "id": "test26", "name": "Agent runtime wires runs and recovery inbox", "status": "pass", "evidence": "focused 2026-08-04 (enabled=true, recoverable=0)" },
+    { "id": "test28", "name": "MCP tool approval and result", "status": "pass", "evidence": "focused 2026-08-04 (DeepWiki read_wiki_structure)" },
+    { "id": "test29", "name": "Wikipedia, webpage reader, calendar, reminders, and location on device", "status": "pending", "evidence": "per-tool unit adapter tests green 2026-08-05; device scenarios pending" },
+    { "id": "test30", "name": "iOS 26 continued processing submit/reject/expire/cancel", "status": "pending", "evidence": "coordinator unit matrix green 2026-08-05; requires regenerated provisioning profile + iPhone on iOS 26" },
+    { "id": "test31", "name": "/workflow runs a message-anchored Dynamic Workflow on device", "status": "pending", "evidence": "PhysicalDeviceFullStackUITests/test31WorkflowCompletesOnDevice now asserts validated candidate generation, automatic one-run launch without Once/Always/Deny UI, exact JavaScript inspection, durable child execution, and final-answer projection; a fresh physical-device xcresult is still required" },
+    { "id": "test32", "name": "Real-model complex Dynamic Workflow exploratory matrix", "status": "pending", "evidence": "DynamicWorkflowExplorationUITests covers Kimi local-weight feasibility, accessible travel planning, hybrid iOS architecture, crash-boundary incident response, an untrusted-goal boundary, and parameterized ad-hoc goals. Simulator exploration on 2026-08-09 exposed and drove fixes for DeepSeek transport selection, structured-answer construction, structured-stream normalization, repair-budget attenuation, template-expression analysis, and bounded structured handoff; a converged five-scenario xcresult and fresh physical-device release evidence remain required." }
+  ]
+}

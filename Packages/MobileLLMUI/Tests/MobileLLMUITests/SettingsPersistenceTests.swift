@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: MIT
+
+import XCTest
+@testable import MobileLLMUI
+import LLMCore
+
+/// Settings persistence across app versions, plus the context clamp. Both are places where a quiet
+/// regression doesn't crash — it just silently changes what the user configured.
+@MainActor
+final class SettingsPersistenceTests: XCTestCase {
+
+    private var defaults: UserDefaults!
+    private let key = "mobileLLM.settings.v1"
+    private let suite = "SettingsPersistenceTests"
+
+    override func setUp() {
+        super.setUp()
+        defaults = UserDefaults(suiteName: suite)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suite)
+        super.tearDown()
+    }
+
+    private func write(_ json: String) { defaults.set(Data(json.utf8), forKey: key) }
+
+    // MARK: System prompt
+
+    func testFreshInstallStartsWithTheStockPrompt() {
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertTrue(SystemPrompt.isStandard(settings.systemPrompt))
+    }
+
+    /// A v1 install has `systemPrompt: ""` and no seed marker — it should get the stock prompt once.
+    func testSeedsTheStockPromptIntoAPreExistingInstall() {
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"","thinkingDefault":true,
+         "thinkingDisplay":"autoCollapse","temperature":0.7,"topP":0.95,"topK":20,
+         "repetitionPenalty":1.05,"maxTokens":1024,"contextLength":8192,"kvBits":4,
+         "appearance":"system"}
+        """#)
+        XCTAssertTrue(SystemPrompt.isStandard(AppSettings(defaults: defaults).systemPrompt))
+    }
+
+    /// …but exactly once. Clearing the prompt on purpose must survive a relaunch, or the seed is a bug.
+    func testDoesNotResurrectAPromptTheUserCleared() {
+        let settings = AppSettings(defaults: defaults)
+        settings.systemPrompt = ""                      // deliberate clear → persists with the seed marker
+        XCTAssertEqual(AppSettings(defaults: defaults).systemPrompt, "")
+    }
+
+    func testKeepsACustomPrompt() {
+        let settings = AppSettings(defaults: defaults)
+        settings.systemPrompt = "Answer only in haiku."
+        XCTAssertEqual(AppSettings(defaults: defaults).systemPrompt, "Answer only in haiku.")
+    }
+
+    // MARK: MCP back-compat (through the whole snapshot)
+
+    /// `MCPServer` grew fields after v1. Decoding is all-or-nothing inside the snapshot, so a server
+    /// written by the old build must not take temperature/model/appearance down with it.
+    func testOldMCPServerEntryDoesNotDestroyEveryOtherSetting() {
+        write(#"""
+        {"defaultModelID":"qwen35-9b","systemPrompt":"keep me","thinkingDefault":false,
+         "thinkingDisplay":"autoCollapse","toolsEnabled":true,
+         "mcpServers":[{"name":"DeepWiki","url":"https://mcp.deepwiki.com/mcp"}],
+         "temperature":0.42,"topP":0.95,"topK":20,"repetitionPenalty":1.05,"maxTokens":1024,
+         "contextLength":16384,"kvBits":4,"appearance":"dark"}
+        """#)
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.temperature, 0.42, accuracy: 0.001)
+        XCTAssertEqual(settings.defaultModelID, "qwen35-9b")
+        XCTAssertEqual(settings.systemPrompt, "keep me")
+        XCTAssertEqual(settings.mcpServers.count, 1)
+        XCTAssertTrue(settings.mcpServers.first?.isEnabled ?? false)
+    }
+
+    // MARK: Built-in tool toggles (D2)
+
+    /// The new tool fields survive a save/reload.
+    func testToolToggleFieldsRoundTrip() {
+        let settings = AppSettings(defaults: defaults)
+        settings.disabledBuiltInTools = ["web_search", "current_location"]
+        settings.searchEngines = [.bing]
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.disabledBuiltInTools, ["web_search", "current_location"])
+        XCTAssertEqual(reloaded.searchEngines, [.bing])
+    }
+
+    /// The online-model toggle must survive a save/reload like every other setting; a fresh install
+    /// starts with it off so no data egress happens by accident.
+    func testOpenAIOnlineToggleRoundTripAndDefaultsOff() {
+        XCTAssertFalse(AppSettings(defaults: defaults).openAIOnlineEnabled)
+
+        let settings = AppSettings(defaults: defaults)
+        settings.openAIBaseURL = "https://gateway.example.com/v1"
+        settings.openAIModelID = "gpt-4o-mini"
+        settings.openAIOnlineEnabled = true
+
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertTrue(reloaded.openAIOnlineEnabled)
+        XCTAssertEqual(reloaded.openAIModelID, "gpt-4o-mini")
+        XCTAssertEqual(reloaded.openAIBaseURL, "https://gateway.example.com/v1")
+    }
+
+    /// Multiple services persist as a list, at most one is active, and enabling one deactivates the
+    /// others — the single-active invariant survives a save/reload.
+    func testMultipleOnlineServicesPersistWithSingleActive() {
+        let settings = AppSettings(defaults: defaults)
+        settings.upsertOnlineService(OnlineService(
+            id: "svc-gateway",
+            name: "Gateway",
+            baseURL: "https://gateway.example.com/v1",
+            modelID: "gateway-model"
+        ))
+        settings.upsertOnlineService(OnlineService(
+            id: "svc-openai",
+            name: "OpenAI",
+            baseURL: "https://api.openai.com/v1",
+            modelID: "gpt-4o-mini",
+            isEnabled: true
+        ))
+
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.onlineServices.count, 2)
+        XCTAssertEqual(reloaded.onlineActiveService?.id, "svc-openai")
+        XCTAssertEqual(reloaded.onlineModelID, "gpt-4o-mini")
+
+        reloaded.setOnlineServiceEnabled(id: "svc-gateway", enabled: true)
+        XCTAssertEqual(reloaded.onlineActiveService?.id, "svc-gateway")
+        XCTAssertEqual(reloaded.onlineModelID, "gateway-model")
+        XCTAssertEqual(
+            reloaded.onlineServices.first { $0.id == "svc-openai" }?.isEnabled,
+            false,
+            "enabling one service must deactivate the other"
+        )
+
+        reloaded.removeOnlineService(id: "svc-gateway")
+        XCTAssertEqual(reloaded.onlineServices.count, 1)
+        XCTAssertEqual(reloaded.onlineServices.first?.id, "svc-openai")
+    }
+
+    /// Online context is its own preference (default 32K, not the local 8K) and persists independently.
+    func testOnlineContextLengthPersistsIndependently() {
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.onlineContextLength, 32_768)
+
+        settings.contextLength = 4_096
+        settings.onlineContextLength = 65_536
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.contextLength, 4_096)
+        XCTAssertEqual(reloaded.onlineContextLength, 65_536)
+    }
+
+    /// Pre-auto builds persisted 4096 as the only possible onlineMaxTokens (no UI exposed it). That
+    /// value now means "auto" (0) so upgraded installs use the model's own maximum instead of an
+    /// accidental product cap. Non-legacy explicit values survive untouched.
+    func testLegacyOnlineMaxTokens4096MigratesToAuto() {
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep","thinkingDefault":true,
+         "thinkingDisplay":"autoCollapse","temperature":0.7,"topP":0.95,"topK":20,
+         "repetitionPenalty":1.05,"maxTokens":1024,"onlineMaxTokens":4096,
+         "contextLength":8192,"kvBits":4,"appearance":"system"}
+        """#)
+        let migrated = AppSettings(defaults: defaults)
+        XCTAssertEqual(migrated.onlineMaxTokens, 0)
+        // The migration marker is stamped on first load, so an explicit 4096 chosen in the new UI
+        // survives relaunch instead of being converted to auto again.
+        migrated.onlineMaxTokens = 4_096
+        XCTAssertEqual(AppSettings(defaults: defaults).onlineMaxTokens, 4_096)
+
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep","thinkingDefault":true,
+         "thinkingDisplay":"autoCollapse","temperature":0.7,"topP":0.95,"topK":20,
+         "repetitionPenalty":1.05,"maxTokens":1024,"onlineMaxTokens":8192,
+         "contextLength":8192,"kvBits":4,"appearance":"system"}
+        """#)
+        XCTAssertEqual(AppSettings(defaults: defaults).onlineMaxTokens, 8_192)
+    }
+
+    /// Per-service model output metadata survives save/reload and feeds the runtime ceiling.
+    func testOnlineServiceMaxOutputMetadataRoundTrips() {
+        let settings = AppSettings(defaults: defaults)
+        settings.upsertOnlineService(OnlineService(
+            id: "svc-cap",
+            name: "Capped",
+            baseURL: "https://gateway.example.com/v1",
+            modelID: "capped-model",
+            maximumOutputTokens: 16_384
+        ))
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.onlineServices.first?.maximumOutputTokens, 16_384)
+
+        // Unknown stays nil through a save/reload (0 entered in the editor normalizes to nil).
+        settings.upsertOnlineService(OnlineService(
+            id: "svc-cap",
+            name: "Capped",
+            baseURL: "https://gateway.example.com/v1",
+            modelID: "capped-model",
+            maximumOutputTokens: nil
+        ))
+        XCTAssertNil(AppSettings(defaults: defaults).onlineServices.first?.maximumOutputTokens)
+    }
+
+    /// A pre-D2 snapshot (no tool fields at all) decodes to the defaults: the privacy-sensitive tools off,
+    /// the full engine set on — so an upgraded install behaves exactly like a fresh one, and the surrounding
+    /// settings are untouched (all-or-nothing decode).
+    func testOldSnapshotDecodesWithToolDefaults() {
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep me","systemPromptSeeded":true,
+         "thinkingDefault":true,"thinkingDisplay":"autoCollapse","toolsEnabled":true,
+         "temperature":0.7,"topP":0.95,"topK":20,"repetitionPenalty":1.05,"maxTokens":1024,
+         "contextLength":8192,"kvBits":4,"appearance":"system"}
+        """#)
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.disabledBuiltInTools, AppSettings.defaultDisabledBuiltInTools)
+        XCTAssertEqual(
+            Set(settings.searchEngines),
+            [.duckduckgo, .bing, .brave, .yahoo, .marginalia]
+        )
+        XCTAssertEqual(settings.builtInToolConfig.enabled, BuiltInToolConfig.defaultEnabled,
+                       "the derived config matches D1's default-enabled set exactly")
+        XCTAssertEqual(settings.systemPrompt, "keep me", "unrelated settings survive the added fields")
+    }
+
+    /// A pre-Brave install persisted the legacy two-engine default; loading it must migrate to the
+    /// fresh-install three-engine default so the tool plan and the run ceiling stay in lockstep.
+    func testLegacyTwoEngineDefaultMigratesToBrave() {
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep me","systemPromptSeeded":true,
+         "thinkingDefault":true,"thinkingDisplay":"autoCollapse","toolsEnabled":true,
+         "temperature":0.7,"topP":0.95,"topK":20,"repetitionPenalty":1.05,"maxTokens":1024,
+         "contextLength":8192,"kvBits":4,"appearance":"system","searchEngines":["duckduckgo","bing"]}
+        """#)
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.searchEngines, [.duckduckgo, .bing, .brave])
+    }
+
+    func testOpenAIServiceConfigRoundTripAndInvalidFallback() {
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep me","systemPromptSeeded":true,
+         "thinkingDefault":true,"thinkingDisplay":"autoCollapse","toolsEnabled":true,
+         "temperature":0.7,"topP":0.95,"topK":20,"repetitionPenalty":1.05,"maxTokens":1024,
+         "contextLength":8192,"kvBits":4,"appearance":"system",
+         "openAIBaseURL":"https://gateway.example.com/v1","openAIModelID":"gpt-4o-mini"}
+        """#)
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.openAIBaseURL, "https://gateway.example.com/v1")
+        XCTAssertEqual(settings.openAIModelID, "gpt-4o-mini")
+
+        // A stored non-https or malformed base URL must never survive a load.
+        write(#"""
+        {"defaultModelID":"bonsai-8b","systemPrompt":"keep me","systemPromptSeeded":true,
+         "thinkingDefault":true,"thinkingDisplay":"autoCollapse","toolsEnabled":true,
+         "temperature":0.7,"topP":0.95,"topK":20,"repetitionPenalty":1.05,"maxTokens":1024,
+         "contextLength":8192,"kvBits":4,"appearance":"system",
+         "openAIBaseURL":"http://insecure.example","openAIModelID":"gpt-4o-mini"}
+        """#)
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.openAIBaseURL, OpenAIServiceConfiguration.defaultBaseURL)
+        XCTAssertEqual(reloaded.openAIModelID, "gpt-4o-mini",
+                       "the model id is non-secret configuration and survives")
+    }
+
+    /// A fresh install disables exactly the three privacy-sensitive capabilities (four tool ids) and leaves
+    /// every other built-in on.
+    func testFreshInstallDisablesOnlyPrivacyTools() {
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.disabledBuiltInTools,
+                       ["create_calendar_event", "list_calendar_events", "create_reminder", "current_location"])
+        XCTAssertEqual(settings.builtInToolConfig.enabled, BuiltInToolConfig.defaultEnabled)
+    }
+
+    /// `builtInToolConfig` is the single mapping from the persisted toggles to the assembled registry:
+    /// a disabled tool is dropped, one not disabled is enabled, and the engine priority order carries through.
+    func testBuiltInToolConfigReflectsToggles() {
+        let settings = AppSettings(defaults: defaults)
+        settings.disabledBuiltInTools = ["web_search"]          // web_search off; calendar/etc. now on
+        settings.searchEngines = [.bing, .duckduckgo]
+        let config = settings.builtInToolConfig
+        XCTAssertFalse(config.enabled.contains(.webSearch))
+        XCTAssertTrue(config.enabled.contains(.calculator))
+        XCTAssertTrue(config.enabled.contains(.createCalendarEvent), "not in the disabled set → enabled")
+        XCTAssertEqual(config.searchEngines, [.bing, .duckduckgo], "engine priority order is preserved")
+    }
+
+    /// An empty engine selection can't produce a broken web_search tool — the config falls back to
+    /// the full default engine set.
+    func testBuiltInToolConfigFallsBackWhenNoEnginesChosen() {
+        let settings = AppSettings(defaults: defaults)
+        settings.searchEngines = []
+        XCTAssertEqual(
+            Set(settings.builtInToolConfig.searchEngines),
+            [.duckduckgo, .bing, .brave, .yahoo, .marginalia]
+        )
+    }
+
+    // MARK: Context clamp
+
+    func testSamplingClampsContextToTheModelsNativeCeiling() {
+        let settings = AppSettings(defaults: defaults)
+        settings.contextLength = 32_768
+        // No model → the raw request (nothing to clamp against).
+        XCTAssertEqual(settings.sampling(thinking: false).contextTokenCap, 32_768)
+        // A model that supports it → unchanged.
+        let big = LLMCatalog.bonsai8b
+        XCTAssertEqual(settings.sampling(thinking: false, model: big).contextTokenCap,
+                       min(32_768, big.architecture.nativeContext))
+    }
+}

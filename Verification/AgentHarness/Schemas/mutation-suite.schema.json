@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mobilellm.local/schemas/agent-harness/mutation-suite.v1.schema.json",
+  "title": "mobileLLM Agent Harness curated mutation suite",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schemaVersion", "documentID", "mutations"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "documentID": { "const": "AH-MUTATION-SUITE-V1" },
+    "mutations": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/mutation" }
+    }
+  },
+  "$defs": {
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "package", "file", "original", "replacement", "testFilter"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^AH-MUTATION-[0-9]{3}$" },
+        "package": { "enum": ["AgentContracts", "AgentRuntime"] },
+        "file": { "type": "string", "pattern": "^Packages/(AgentContracts|AgentRuntime)/Sources/.+\\.swift$" },
+        "original": { "type": "string", "minLength": 1 },
+        "replacement": { "type": "string", "minLength": 1 },
+        "testFilter": { "type": "string", "pattern": "^[A-Za-z0-9_]+/test[A-Za-z0-9_]+$" }
+      }
+    }
+  }
+}

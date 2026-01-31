@@ -1,0 +1,55 @@
+{
+  "$schema": "../Schemas/mutation-suite.schema.json",
+  "schemaVersion": 1,
+  "documentID": "AH-MUTATION-SUITE-V1",
+  "mutations": [
+    {
+      "id": "AH-MUTATION-001",
+      "package": "AgentRuntime",
+      "file": "Packages/AgentRuntime/Sources/AgentRuntime/Policy/ApprovalPolicyEngine.swift",
+      "original": "if receipt.decision == .denied { return (.deniedCurrentRequest, receipt) }",
+      "replacement": "if receipt.decision == .approved { return (.deniedCurrentRequest, receipt) }",
+      "testFilter": "ApprovalPolicyEngineTests/testDeniedAndCancelledCurrentRequestFailClosed"
+    },
+    {
+      "id": "AH-MUTATION-002",
+      "package": "AgentRuntime",
+      "file": "Packages/AgentRuntime/Sources/AgentRuntime/Execution/AgentRunController+Commands.swift",
+      "original": "} else if command.expectedRunStateVersion != facts.projection.stateVersion {",
+      "replacement": "} else if command.expectedRunStateVersion == UInt64.max {",
+      "testFilter": "AgentExecutorCommandIntegrationTests/testCancelDuringGenerationTerminatesAtSafeBoundaryAndStaleCommandCannotMutate"
+    },
+    {
+      "id": "AH-MUTATION-003",
+      "package": "AgentContracts",
+      "file": "Packages/AgentContracts/Sources/AgentContracts/ExternalOperations.swift",
+      "original": "throw AgentContractError.authorizationBindingMismatch(\"unplanned boundary destination\")",
+      "replacement": "kind = .primary; position = 1",
+      "testFilter": "AuthorityAndAuthorizationTests/testBoundaryHopBindsCanonicalItineraryPositionAndDestination"
+    },
+    {
+      "id": "AH-MUTATION-004",
+      "package": "AgentContracts",
+      "file": "Packages/AgentContracts/Sources/AgentContracts/Budgets.swift",
+      "original": "guard existing == reservation else {",
+      "replacement": "guard existing.id == reservation.id else {",
+      "testFilter": "BudgetLedgerTests/testReserveIsIdempotentAndConflictingReuseFailsClosed"
+    },
+    {
+      "id": "AH-MUTATION-005",
+      "package": "AgentRuntime",
+      "file": "Packages/AgentRuntime/Sources/AgentRuntime/RunJournal.swift",
+      "original": "guard !previous.runState.isTerminal else {",
+      "replacement": "guard previous.runState.isTerminal || !previous.runState.isTerminal else {",
+      "testFilter": "RunJournalContractTests/testAppendRequestRejectsRegressionsIllegalEdgesAndEventsAfterTerminal"
+    },
+    {
+      "id": "AH-MUTATION-006",
+      "package": "AgentContracts",
+      "file": "Packages/AgentContracts/Sources/AgentContracts/Budgets.swift",
+      "original": "guard effective <= limit else {",
+      "replacement": "guard effective <= limit &+ 1 else {",
+      "testFilter": "BudgetLedgerTests/testEveryBudgetDimensionRejectsAboveAndAcceptsBelowOrEqual"
+    }
+  ]
+}

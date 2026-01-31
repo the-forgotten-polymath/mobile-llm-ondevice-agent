@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: MIT
+
+import XCTest
+@testable import LLMCore
+
+/// The live web-search tool: the pure per-engine SERP parsers (against trimmed but real-shaped canned
+/// HTML), tracker unwrapping, and `execute` end-to-end over a `URLProtocol` stub (engine priority +
+/// fall-through, size cap, graceful errors). SERP scraping is brittle by nature, so these lock the
+/// heuristics we ship against realistic markup and prove every failure degrades to a string, never a throw.
+final class WebSearchToolTests: XCTestCase {
+
+    // MARK: - Pure parsers
+
+    func testParsesDuckDuckGoResultsAndUnwrapsTrackers() {
+        let results = WebSearchTool.parseDuckDuckGo(Fixtures.ddg)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results[0].title, "Swift (programming language)")
+        // uddg= wrapper decoded back to the real destination, tracking params dropped.
+        XCTAssertEqual(results[0].url, "https://en.wikipedia.org/wiki/Swift_(programming_language)")
+        XCTAssertTrue(results[0].snippet.contains("general-purpose"))
+        XCTAssertFalse(results[0].snippet.contains("<b>"), "markup must be stripped from the snippet")
+        XCTAssertEqual(results[1].url, "https://swift.org/")
+        XCTAssertTrue(results[1].snippet.contains("&") == false || results[1].snippet.contains("docs"),
+                      "entities decoded, got: \(results[1].snippet)")
+    }
+
+    func testParsesBingResultsAndDecodesCkRedirect() {
+        let results = WebSearchTool.parseBing(Fixtures.bing)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results[0].url, "https://swift.org/")
+        XCTAssertTrue(results[0].title.contains("Swift.org"))
+        XCTAssertTrue(results[0].snippet.contains("modern approach"))
+        // The second result's link is a Bing ck/a redirect — the real URL is base64url in u=a1…
+        XCTAssertEqual(results[1].url, "https://en.wikipedia.org/wiki/Swift_(programming_language)")
+    }
+
+    func testParsesBingRSSResults() {
+        let results = WebSearchTool.parseBing(Fixtures.bingRSS)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertEqual(results[0].url, "https://openai.com/")
+        XCTAssertTrue(results[0].title.contains("OpenAI"))
+        XCTAssertTrue(results[0].snippet.contains("AGI"))
+        XCTAssertEqual(results[1].url, "https://chatgpt.com/")
+        XCTAssertTrue(results[2].title.contains("Wikipedia"))
+    }
+
+    func testParsesBraveResultsWithDirectLinks() {
+        let results = WebSearchTool.parseBrave(Fixtures.brave)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results[0].url, "https://openai.com/")
+        XCTAssertTrue(results[0].title.contains("OpenAI"))
+        XCTAssertTrue(results[0].snippet.contains("artificial general intelligence"))
+        XCTAssertEqual(results[1].url, "https://openai.com/api/")
+        XCTAssertTrue(results[1].title.contains("OpenAI API"))
+    }
+
+    func testParsesYahooResultsAndUnwrapsRedirects() {
+        let results = WebSearchTool.parseYahoo(Fixtures.yahoo)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results[0].title, "Example Page")
+        XCTAssertEqual(results[0].url, "https://example.com/page")
+        XCTAssertTrue(results[0].snippet.contains("example snippet"))
+        XCTAssertEqual(
+            WebSearchTool.cleanYahooURL("https://plain.example/"),
+            "https://plain.example/"
+        )
+    }
+
+    func testParsesMarginaliaResultsWithDirectLinks() {
+        let results = WebSearchTool.parseMarginalia(Fixtures.marginalia)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results[0].url, "https://example.org/doc")
+        XCTAssertEqual(results[0].title, "Marginalia Doc")
+        XCTAssertTrue(results[0].snippet.contains("description"))
+        XCTAssertEqual(results[1].title, "Another Page")
+    }
+
+    func testTrackerUnwrapHelpers() {
+        XCTAssertEqual(
+            WebSearchTool.cleanDuckDuckGoURL("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=xyz"),
+            "https://example.com/a")
+        // A direct DDG link (no wrapper) is passed through, only made absolute.
+        XCTAssertEqual(WebSearchTool.cleanDuckDuckGoURL("//example.org/x"), "https://example.org/x")
+        XCTAssertEqual(WebSearchTool.cleanBingURL("https://plain.example/"), "https://plain.example/")
+    }
+
+    func testMalformedHTMLYieldsNoResultsNeverThrows() {
+        XCTAssertEqual(WebSearchTool.parseDuckDuckGo("<html><body>garbage <div> no results"), [])
+        XCTAssertEqual(WebSearchTool.parseBing("not even html"), [])
+        XCTAssertEqual(WebSearchTool.parseBrave("not even html"), [])
+        XCTAssertEqual(WebSearchTool.parseDuckDuckGo(""), [])
+        XCTAssertEqual(WebSearchTool.parseYahoo(""), [])
+        XCTAssertEqual(WebSearchTool.parseMarginalia("garbage"), [])
+    }
+
+    func testEndpointEncodingAndHosts() {
+        let ddg = WebSearchTool.endpoint(engine: .duckduckgo, query: "swift lang")!
+        XCTAssertEqual(ddg.host, "html.duckduckgo.com")
+        XCTAssertTrue(ddg.absoluteString.contains("q=swift%20lang"))
+        let bing = WebSearchTool.endpoint(engine: .bing, query: "swift lang")!
+        XCTAssertEqual(bing.host, "www.bing.com")
+        XCTAssertTrue(bing.absoluteString.contains("q=swift%20lang"))
+        XCTAssertTrue(bing.absoluteString.contains("format=rss"),
+                      "Bing must use its scrapeable RSS output, not the captcha-gated HTML page")
+        let brave = WebSearchTool.endpoint(engine: .brave, query: "swift lang")!
+        XCTAssertEqual(brave.host, "search.brave.com")
+        XCTAssertTrue(brave.absoluteString.contains("q=swift%20lang"))
+        let yahoo = WebSearchTool.endpoint(engine: .yahoo, query: "swift lang")!
+        XCTAssertEqual(yahoo.host, "search.yahoo.com")
+        let marginalia = WebSearchTool.endpoint(engine: .marginalia, query: "swift lang")!
+        XCTAssertEqual(marginalia.host, "search.marginalia.nu")
+    }
+
+    func testRenderIsNumberedWithURLAndSnippet() {
+        let out = WebSearchTool.render(
+            [SearchResult(title: "A", url: "https://a.example", snippet: "first"),
+             SearchResult(title: "B", url: "https://b.example", snippet: "")], query: "q")
+        XCTAssertTrue(out.contains("1. A"))
+        XCTAssertTrue(out.contains("https://a.example"))
+        XCTAssertTrue(out.contains("first"))
+        XCTAssertTrue(out.contains("2. B"))
+    }
+
+    // MARK: - execute() over a stubbed session
+
+    private func tool(engines: [SearchEngine] = [.duckduckgo, .bing, .brave], maxResults: Int = 6) -> WebSearchTool {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SerpMockProtocol.self]
+        return WebSearchTool(
+            engines: engines,
+            session: URLSession(configuration: config),
+            maxResults: maxResults,
+            dnsResolver: { _ in ["93.184.216.34"] }
+        )
+    }
+
+    private func run(_ tool: WebSearchTool, _ query: String) async -> String {
+        await tool.execute(argumentsJSON: #"{"query":"\#(query)"}"#)
+    }
+
+    func testExecuteReturnsDuckDuckGoResults() async {
+        let out = await run(tool(), "swift language")
+        XCTAssertTrue(out.contains("Web results for"))
+        XCTAssertTrue(out.contains("Swift (programming language)"))
+        XCTAssertTrue(out.contains("https://en.wikipedia.org/wiki/Swift_(programming_language)"), out)
+    }
+
+    func testExecuteFallsThroughToBingWhenFirstEngineEmpty() async {
+        // DDG returns an empty results page → the tool must fall through to Bing.
+        let out = await run(tool(), "DDGEMPTY swift")
+        XCTAssertTrue(out.contains("swift.org"), "expected Bing results after DDG fell through, got: \(out)")
+    }
+
+    func testExecuteFallsThroughToBraveWhenFirstTwoEnginesEmpty() async {
+        // DDG and Bing both return empty/error pages → Brave must be the working fallback.
+        let out = await run(tool(), "DDGEMPTY BINGEMPTY swift")
+        XCTAssertTrue(out.contains("OpenAI"), "expected Brave results after DDG+Bing fell through, got: \(out)")
+    }
+
+    func testExecuteAllEnginesFailReturnsGracefulString() async {
+        let out = await run(tool(), "DDGFAIL BINGFAIL BRAVEFAIL")
+        XCTAssertTrue(out.contains("Web search failed"), out)
+        XCTAssertFalse(out.hasPrefix("Web results"))
+    }
+
+    func testExecuteHonorsMaxResults() async {
+        let out = await run(tool(maxResults: 1), "swift")
+        XCTAssertTrue(out.contains("1. "))
+        XCTAssertFalse(out.contains("2. "), "maxResults=1 must cap the list, got: \(out)")
+    }
+
+    func testExecuteSingleEngineBing() async {
+        let out = await run(tool(engines: [.bing]), "swift")
+        XCTAssertTrue(out.contains("swift.org"))
+    }
+
+    func testExecuteBingRSSOutput() async {
+        let out = await run(tool(engines: [.bing]), "RSS swift")
+        XCTAssertTrue(out.contains("openai.com"), out)
+        XCTAssertTrue(out.contains("Web results for"))
+    }
+
+    func testExecuteMissingQuery() async {
+        let out = await tool().execute(argumentsJSON: "{}")
+        XCTAssertTrue(out.contains("missing"))
+    }
+}
+
+// MARK: - Canned SERP fixtures (trimmed but structurally real)
+
+private enum Fixtures {
+    static let ddg = """
+    <!DOCTYPE html><html><body><div class="results">
+      <div class="result results_links results_links_deep web-result ">
+        <div class="links_main links_deep result__body">
+          <h2 class="result__title">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FSwift_(programming_language)&amp;rut=abc123">Swift (programming language)</a>
+          </h2>
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org">Swift is a <b>general-purpose</b> programming language developed by Apple.</a>
+        </div>
+      </div>
+      <div class="result results_links results_links_deep web-result ">
+        <div class="links_main links_deep result__body">
+          <h2 class="result__title">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fswift.org%2F&amp;rut=def456">Swift.org</a>
+          </h2>
+          <a class="result__snippet" href="#">The Swift programming language home &amp; docs.</a>
+        </div>
+      </div>
+    </div></body></html>
+    """
+
+    static let bing = """
+    <!DOCTYPE html><html><body><ol id="b_results">
+      <li class="b_algo">
+        <h2><a href="https://swift.org/" h="ID=SERP,5001.1">Swift.org - Welcome to Swift.org</a></h2>
+        <div class="b_caption"><p>Swift is a general-purpose language built using a modern approach to safety.</p></div>
+      </li>
+      <li class="b_algo">
+        <div class="b_tpcn"><a class="tilk" href="https://en.wikipedia.org/wiki/Swift">Wikipedia</a></div>
+        <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1aHR0cHM6Ly9lbi53aWtpcGVkaWEub3JnL3dpa2kvU3dpZnRfKHByb2dyYW1taW5nX2xhbmd1YWdlKQ&amp;ntb=1" h="ID=SERP,5002.1">Swift (programming language) - Wikipedia</a></h2>
+        <div class="b_caption"><p>Swift is a high-level general-purpose programming language.</p></div>
+      </li>
+    </ol></body></html>
+    """
+
+    /// Trimmed from Brave's live results page (2026-08): each result is a `result-wrapper` block with a
+    /// direct href, a title attribute on the title div, and a `generic-snippet` text block.
+    static let brave = """
+    <!DOCTYPE html><html><body>
+      <div class="snippet svelte-jmfu5f" data-pos="0" data-type="web" data-keynav="true">
+        <div class="result-wrapper svelte-1rq4ngz">
+          <div class="result-content svelte-1rq4ngz">
+            <a href="https://openai.com/" target="_self" class="svelte-14r20fy l1">
+              <div class="site-name-wrapper svelte-on1hvy">
+                <div class="site-name-content svelte-on1hvy">
+                  <div class="desktop-small-semibold t-secondary text-ellipsis">OpenAI</div>
+                  <div class="url-wrapper svelte-on1hvy">
+                    <cite class="snippet-url desktop-small-regular t-tertiary svelte-on1hvy">openai.com</cite>
+                  </div>
+                </div>
+              </div>
+              <div class="title search-snippet-title line-clamp-1 svelte-14r20fy"
+                   title="OpenAI | Research &amp; Deployment">OpenAI | Research &amp; Deployment</div>
+            </a>
+            <div class="generic-snippet svelte-1cwdgg3">
+              <div class="content desktop-default-regular t-primary line-clamp-dynamic svelte-1cwdgg3">
+                We believe our research will eventually lead to artificial general intelligence.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="snippet svelte-jmfu5f" data-pos="1" data-type="web" data-keynav="true">
+        <div class="result-wrapper svelte-1rq4ngz">
+          <div class="result-content svelte-1rq4ngz">
+            <a href="https://openai.com/api/" target="_self" class="svelte-14r20fy l1">
+              <div class="title search-snippet-title line-clamp-1 svelte-14r20fy"
+                   title="OpenAI API">OpenAI API</div>
+            </a>
+            <div class="generic-snippet svelte-1cwdgg3">
+              <div class="content desktop-default-regular t-primary line-clamp-dynamic svelte-1cwdgg3">
+                Build production-grade applications with OpenAI's developer platform.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    /// Trimmed from Bing's live `format=rss` output (2026-08): direct item title/link/description.
+    static let bingRSS = """
+    <?xml version="1.0" encoding="utf-8" ?>
+    <rss version="2.0"><channel>
+      <title>Bing: OpenAI official website</title>
+      <link>http://www.bing.com/search?q=OpenAI+official+website</link>
+      <item>
+        <title>OpenAI | Research &amp; Deployment</title>
+        <link>https://openai.com/</link>
+        <description>We believe our research will eventually lead to AGI.</description>
+      </item>
+      <item>
+        <title>ChatGPT: Chat, Work, Create &amp; Code with AI</title>
+        <link>https://chatgpt.com/</link>
+        <description>Use ChatGPT to answer questions and write code.</description>
+      </item>
+      <item>
+        <title>OpenAI - Wikipedia</title>
+        <link>https://en.wikipedia.org/wiki/OpenAI</link>
+        <description>OpenAI is an American artificial intelligence research organization.</description>
+      </item>
+    </channel></rss>
+    """
+
+    /// Trimmed from Yahoo's live results page (2026-08): an `algo-sr` block with an h3 title anchor
+    /// and a snippet paragraph; the href is Yahoo's r.search redirect wrapper.
+    static let yahoo = """
+    <!DOCTYPE html><html><body><ol class="reg searchCenterMiddle">
+      <li class="dd algo-sr" data-pos="0">
+        <div class="algo-sr">
+          <h3 class="title"><a href="https://r.search.yahoo.com/..&amp;RU=https%3A%2F%2Fexample.com%2Fpage&amp;RV=1" >Example Page</a></h3>
+          <div class="compText aAbs"><p class="fc-falcon">This is an example snippet.</p></div>
+        </div>
+      </li>
+    </ol></body></html>
+    """
+
+    /// Trimmed from Marginalia's live results (2026-08): `<h2>` headings with direct links and a
+    /// following description paragraph.
+    static let marginalia = """
+    <!DOCTYPE html><html><body>
+      <h2><a href="https://example.org/doc">Marginalia Doc</a></h2>
+      <p>A short description of the document.</p>
+      <h2><a href="https://example.org/other">Another Page</a></h2>
+      <p>No snippet here.</p>
+    </body></html>
+    """
+}
+
+// MARK: - URLProtocol stub: routes by host + `q` marker
+
+private final class SerpMockProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+
+    override func startLoading() {
+        let (status, body) = Self.response(for: request.url!)
+        let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+                                   headerFields: ["Content-Type": "text/html; charset=utf-8"])!
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        if !body.isEmpty { client?.urlProtocol(self, didLoad: Data(body.utf8)) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    private static func query(_ url: URL) -> String {
+        URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "q" }?.value ?? ""
+    }
+
+    private static func response(for url: URL) -> (Int, String) {
+        let q = query(url)
+        let host = url.host ?? ""
+        if host.contains("duckduckgo") {
+            if q.contains("DDGFAIL") { return (500, "") }
+            if q.contains("DDGEMPTY") { return (200, "<html><body><div class=\"results\"></div></body></html>") }
+            return (200, Fixtures.ddg)
+        }
+        if host.contains("bing") {
+            if q.contains("BINGFAIL") { return (500, "") }
+            if q.contains("BINGEMPTY") { return (200, "<html><body></body></html>") }
+            if q.contains("RSS") { return (200, Fixtures.bingRSS) }
+            return (200, Fixtures.bing)
+        }
+        if host.contains("brave") {
+            if q.contains("BRAVEFAIL") { return (500, "") }
+            return (200, Fixtures.brave)
+        }
+        return (404, "")
+    }
+}

@@ -1,0 +1,34 @@
+{
+  "configurations" : [
+    {
+      "id" : "DAE65D48-FA6E-4B14-AEF3-C8CC1B8EF16A",
+      "name" : "Simulator CI",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : true,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:mobileLLM.xcodeproj",
+      "identifier" : "5EA2BB4C50B6CB125163180C",
+      "name" : "mobileLLM"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : false,
+      "selectedTests" : [
+        "SimulatorCISmokeUITests/testApprovalIsCompleteAtMaximumDynamicTypeAndAcceptsOneDecision",
+        "SimulatorCISmokeUITests/testNeutralLaunchAndPrimaryNavigationAreInteractive"
+      ],
+      "target" : {
+        "containerPath" : "container:mobileLLM.xcodeproj",
+        "identifier" : "E1A8201437C70B781A96B9F7",
+        "name" : "mobileLLMUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

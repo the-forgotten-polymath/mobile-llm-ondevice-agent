@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: MIT
+
+import XCTest
+@testable import AppRuntime
+
+/// Filesystem-level tests for the download install probes (no network). Covers the single-file
+/// (GGUF) install check added for the llama.cpp engine, alongside the flat MLX-repo check.
+final class ModelDownloaderTests: XCTestCase {
+
+    private var base: URL!
+
+    override func setUpWithError() throws {
+        base = FileManager.default.temporaryDirectory
+            .appending(component: "mobilellm-dl-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: base)
+    }
+
+    private func write(_ url: URL, bytes: Int) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(count: bytes).write(to: url)
+    }
+
+    /// A single-file GGUF variant reads as downloaded once its named file is present.
+    func testSingleFileDownloadedWhenGGUFPresent() throws {
+        let dl = ModelDownloader(downloadBase: base)
+        let repo = "prism-ml/Bonsai-8B-gguf"
+        let file = "Bonsai-8B-Q1_0.gguf"
+        XCTAssertFalse(dl.isDownloaded(repoId: repo, fileName: file), "absent file → not downloaded")
+
+        try write(dl.localURL(repoId: repo).appending(component: file), bytes: 1024)
+        XCTAssertTrue(dl.isDownloaded(repoId: repo, fileName: file), "present file → downloaded")
+    }
+
+    /// An in-progress `.part` sibling means the single file is NOT yet complete.
+    func testSingleFileIncompleteWithPartMarker() throws {
+        let dl = ModelDownloader(downloadBase: base)
+        let repo = "prism-ml/Bonsai-8B-gguf"
+        let file = "Bonsai-8B-Q1_0.gguf"
+        let root = dl.localURL(repoId: repo)
+        try write(root.appending(component: file), bytes: 1024)
+        try write(root.appending(component: file + ".part"), bytes: 128)
+        XCTAssertFalse(dl.isDownloaded(repoId: repo, fileName: file), "a .part sibling → incomplete")
+    }
+
+    /// The flat-repo probe accepts a `.gguf` as valid weights (no-manifest fallback), not only
+    /// `.safetensors`.
+    func testFlatRepoAcceptsGGUFAsWeights() throws {
+        let dl = ModelDownloader(downloadBase: base)
+        let repo = "some/gguf-repo"
+        try write(dl.localURL(repoId: repo).appending(component: "model-Q1_0.gguf"), bytes: 2048)
+        XCTAssertTrue(dl.isDownloaded(repoId: repo), "a flat repo whose only weight is a .gguf is complete")
+    }
+
+    // MARK: Path-traversal sanitizer (A2.8) — pure function, no network
+
+    func testSafeDestinationAcceptsNormalPaths() {
+        let root = base.appending(component: "models/org/repo")
+        for p in ["model.safetensors", "config.json", "onnx/model.onnx", "a/b/c.json", "tokenizer.model"] {
+            guard let dest = ModelDownloader.safeDestination(root: root, relativePath: p) else {
+                return XCTFail("\(p) should be accepted")
+            }
+            XCTAssertTrue(dest.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/"),
+                          "\(p) must resolve under the model root")
+        }
+    }
+
+    func testSafeDestinationRejectsTraversalAndAbsolute() {
+        let root = base.appending(component: "models/org/repo")
+        for p in ["../evil", "../../etc/passwd", "a/../../b", "/etc/passwd", "",
+                  ".", "a/./b", "..\\..\\evil", "foo/../../bar",
+                  "weights/../../../../System"] {
+            XCTAssertNil(ModelDownloader.safeDestination(root: root, relativePath: p),
+                         "‘\(p)’ must be refused (zip-slip)")
+        }
+    }
+
+    /// A traversal fileName reads as "not downloaded" — the probe never resolves outside the repo root.
+    func testIsDownloadedRejectsTraversalFileName() {
+        let dl = ModelDownloader(downloadBase: base)
+        XCTAssertFalse(dl.isDownloaded(repoId: "org/repo", fileName: "../../secret.gguf"))
+        XCTAssertFalse(dl.isDownloaded(repoId: "org/repo", fileName: "/etc/passwd"))
+    }
+
+    /// Repository ids also originate in remote catalog metadata. They must never become filesystem
+    /// structure outside `downloadBase/models`, even before a tree response is fetched.
+    func testRepositoryIDIsConfinedBeforeNetworkOrFilesystemAccess() async {
+        let dl = ModelDownloader(downloadBase: base)
+        let sentinel = base.appending(component: "models/.invalid-repository").standardizedFileURL
+        let invalid = [
+            "", ".", "..", "../escape", "org/../escape", "org/./model",
+            "/absolute", "org/model/extra", #"org\model"#, "org/\0model",
+        ]
+
+        for repo in invalid {
+            XCTAssertEqual(dl.localURL(repoId: repo).standardizedFileURL, sentinel)
+            XCTAssertFalse(dl.isDownloaded(repoId: repo))
+            XCTAssertFalse(dl.isDownloaded(repoId: repo, fileName: "model.gguf"))
+        }
+
+        let escaped = base.appending(component: "escape")
+        do {
+            _ = try await dl.download(repoId: "../escape", progress: { _ in })
+            XCTFail("an unsafe repository id must fail before starting a request")
+        } catch ModelDownloadError.invalidURL(let value) {
+            XCTAssertEqual(value, "../escape")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: escaped.path))
+    }
+}

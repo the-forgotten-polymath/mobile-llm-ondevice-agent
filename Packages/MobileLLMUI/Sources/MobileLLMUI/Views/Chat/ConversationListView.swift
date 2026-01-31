@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: MIT
+
+import SwiftUI
+import AppUI
+
+/// The conversation list (DESIGN §4): recency-grouped (Pinned / Today / …), searchable, with pin +
+/// swipe-delete-with-undo. Selecting a row activates it; `onSelect` lets iOS push the thread.
+struct ConversationListView: View {
+    @Bindable var chat: ChatStore
+    var showsActiveSelection = true
+    var onSelect: (UUID) -> Void = { _ in }
+    /// Durable agent runs for list badges (spec §20: a neutral launch exposes pending runs through
+    /// conversation badges without navigating to them).
+    var agentRuns: AgentRunStore? = nil
+
+    @State private var query = ""
+    @State private var renaming: Conversation?
+    @State private var renameText = ""
+    /// Active project-tag filter (nil = all conversations), spec §20: Project is pure tag grouping.
+    @State private var projectFilter: String?
+
+    private var groups: [(Format.RecencyGroup, [Conversation])] {
+        let filtered = filteredConversations()
+        return Format.RecencyGroup.allCases.compactMap { group in
+            let items = filtered.filter { Format.group(for: $0.indexEntry) == group }
+            return items.isEmpty ? nil : (group, items)
+        }
+    }
+
+    var body: some View {
+        Group {
+            if chat.conversations.isEmpty {
+                ChatPlaceholder(icon: "bubble.left.and.text.bubble.right",
+                                title: "No conversations yet",
+                                message: "Start a new chat — everything stays on your device.",
+                                actionTitle: "New chat", action: { startNew() })
+            } else {
+                VStack(spacing: 0) {
+                    searchField
+                    if !chat.allProjectTags.isEmpty {
+                        projectChips
+                    }
+                    list
+                }
+                .background(Theme.bg)
+            }
+        }
+        .alert("Rename chat", isPresented: Binding(get: { renaming != nil },
+                                                   set: { if !$0 { renaming = nil } })) {
+            TextField("Title", text: $renameText)
+            Button("Cancel", role: .cancel) { renaming = nil }
+            Button("Save") {
+                if let renaming { chat.rename(renaming.id, to: renameText) }
+                renaming = nil
+            }
+        }
+    }
+
+    /// The app's warm search field (replaces the system `.searchable` chrome so search matches the
+    /// ink-wash surface instead of a stark platform bar).
+    private var searchField: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "magnifyingglass").font(.subheadline).foregroundStyle(Theme.textTertiary)
+            TextField("Search chats", text: $query)
+                .textFieldStyle(.plain)
+                .font(.subheadline)
+                .foregroundStyle(Theme.textPrimary)
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
+        .background(Theme.surface2, in: Capsule())
+        .overlay(Capsule().strokeBorder(Theme.hairline))
+        .padding(.horizontal, Theme.Space.lg).padding(.top, Theme.Space.sm).padding(.bottom, Theme.Space.xs)
+    }
+
+    /// Horizontal tag chips: "All" plus every project tag in use. Selecting one filters the list.
+    private var projectChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.xs) {
+                chip(title: "All", tag: nil)
+                ForEach(chat.allProjectTags, id: \.self) { tag in
+                    chip(title: tag, tag: tag)
+                }
+            }
+            .padding(.horizontal, Theme.Space.lg)
+            .padding(.bottom, Theme.Space.xs)
+        }
+    }
+
+    private func chip(title: String, tag: String?) -> some View {
+        let selected = projectFilter == tag
+        return Button {
+            projectFilter = tag
+        } label: {
+            Text(title)
+                .font(.caption.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Theme.onAccent : Theme.textSecondary)
+                .padding(.horizontal, Theme.Space.sm)
+                .padding(.vertical, 5)
+                .background(selected ? Theme.accent : Theme.surface2,
+                            in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Filter by \(title)")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    private var list: some View {
+        List {
+            ForEach(groups, id: \.0) { group, items in
+                Section {
+                    ForEach(items) { convo in
+                        row(convo)
+                    }
+                } header: {
+                    Text(group.rawValue)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+            }
+        }
+        #if os(iOS)
+        .listStyle(.insetGrouped)
+        #else
+        .listStyle(.sidebar)
+        #endif
+        .scrollDismissesKeyboard(.immediately)   // drag the list → the search keyboard drops
+        // …and so does tapping anywhere (simultaneous, so row taps still navigate) — the search field
+        // otherwise held the keyboard over the list with no way out.
+        .simultaneousGesture(TapGesture().onEnded { ChatThreadView.dismissKeyboard() })
+        .scrollContentBackground(.hidden)
+        .background(Theme.bg)
+        .overlay(alignment: .bottom) {
+            if filteredConversations().isEmpty && !query.isEmpty {
+                Text("No chats match “\(query)”.")
+                    .font(.subheadline).foregroundStyle(Theme.textSecondary).padding()
+            }
+        }
+    }
+
+    private func row(_ convo: Conversation) -> some View {
+        Button { chat.select(convo.id); onSelect(convo.id) } label: {
+            HStack(spacing: Theme.Space.sm) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        if convo.pinned {
+                            Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Theme.accent)
+                        }
+                        Text(convo.title)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                    }
+                    Text(convo.preview)
+                        .font(.caption)
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: Theme.Space.sm)
+                if let run = agentRuns?.presentation(for: convo.id), !run.isTerminal {
+                    AgentRunBadge(run: run)
+                } else if let recoverable = agentRuns?.recoverableRuns.first(where: {
+                    $0.conversationID == convo.id
+                }) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Theme.fitAmber)
+                            .frame(width: 7, height: 7)
+                        Text(recoverable.state == .paused ? "paused" : "needs resume")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        recoverable.state == .paused ? "Run paused" : "Run needs resume"
+                    )
+                }
+                Text(Format.relative(convo.updatedAt))
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize()
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 2)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(showsActiveSelection && convo.id == chat.activeID ? Theme.accentSoft : Color.clear)
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) { chat.delete(convo.id) } label: { Label("Delete", systemImage: "trash") }
+                .tint(Theme.danger)
+        }
+        .swipeActions(edge: .leading) {
+            Button { chat.togglePin(convo.id) } label: {
+                Label(convo.pinned ? "Unpin" : "Pin", systemImage: convo.pinned ? "pin.slash" : "pin")
+            }
+            .tint(Theme.accent)
+        }
+        .contextMenu {
+            Button { chat.togglePin(convo.id) } label: {
+                Label(convo.pinned ? "Unpin" : "Pin", systemImage: convo.pinned ? "pin.slash" : "pin")
+            }
+            Button { beginRename(convo) } label: { Label("Rename", systemImage: "pencil") }
+            Button(role: .destructive) { chat.delete(convo.id) } label: { Label("Delete", systemImage: "trash") }
+        }
+        .accessibilityLabel(convo.title)
+        .accessibilityValue(convo.preview)
+    }
+
+    // MARK: Actions
+
+    private func startNew() {
+        if let conversation = chat.newConversation() { onSelect(conversation.id) }
+    }
+
+    private func beginRename(_ convo: Conversation) {
+        renameText = convo.title
+        renaming = convo
+    }
+
+    private func filteredConversations() -> [Conversation] {
+        var result = chat.conversations
+        if let projectFilter {
+            result = result.filter { convo in
+                convo.projectTagList.contains {
+                    $0.caseInsensitiveCompare(projectFilter) == .orderedSame
+                }
+            }
+        }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return result }
+        return result.filter { convo in
+            convo.title.lowercased().contains(needle)
+                || convo.messages.contains { $0.answer.lowercased().contains(needle) }
+        }
+    }
+}

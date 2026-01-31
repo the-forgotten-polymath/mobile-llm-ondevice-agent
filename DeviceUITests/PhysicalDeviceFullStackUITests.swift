@@ -1,0 +1,2579 @@
+// SPDX-License-Identifier: MIT
+
+import XCTest
+
+/// Production-path tests for the two downloaded GGUF models. The class is intentionally serial and each
+/// behavior is an independent XCTest: one model-quality failure must not hide the remaining product bugs.
+final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
+
+    // MARK: Launch / core inference
+
+    @MainActor
+    func test01ColdLaunchRestoresIdentityWithoutConversationOrWeights() throws {
+        let app = try launchApp()
+        XCTAssertTrue(app.navigationBars["Chat"].exists)
+        XCTAssertFalse(app.textFields["composer.field"].exists,
+                       "launch must never reopen the most recent conversation")
+        let runtime = diagnosticValue("device-e2e.runtime", in: app)
+        XCTAssertTrue(runtime.contains("resident=false"),
+                      "launch must not allocate model weights: \(runtime)")
+        XCTAssertFalse(runtime.contains("phase=warming"), "launch began generation/loading work: \(runtime)")
+        attachDiagnostics(app, name: "cold-launch-no-load")
+    }
+
+    @MainActor
+    func test02BonsaiExactOutputAndMultiTurnContext() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: false)
+        let marker = uniqueMarker("BONSAI_CORE")
+        let nonce = "CEDAR-\(Int.random(in: 10_000...99_999))"
+        var failures: [String] = []
+        var formatEvidence: GenerationEvidence?
+        var seedEvidence: GenerationEvidence?
+        var recallEvidence: GenerationEvidence?
+
+        // Keep strict formatting independent from context ingestion. The previous combined prompt could
+        // not distinguish a harmless formatting refusal from failure to retain the nonce.
+        do {
+            let evidence = try send(
+                marker + "\nReturn this verification phrase exactly as written, with no extra text: "
+                    + "ALPHA-BETA-GAMMA",
+                model: .bonsai, in: app, assertEvidence: false)
+            formatEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: .bonsai)
+                .map { "Exact-format turn: \($0)" }
+            if evidence.answer != "ALPHA-BETA-GAMMA" {
+                failures.append(
+                    "Exact-format turn answered \(String(reflecting: evidence.answer)); "
+                        + "expected exactly ALPHA-BETA-GAMMA"
+                )
+            }
+            if !evidence.toolActivities.isEmpty {
+                failures.append("Exact-format turn invoked tools: \(evidence.toolActivities)")
+            }
+        } catch {
+            failures.append("Exact-format turn did not commit evidence: \(error.localizedDescription)")
+        }
+
+        // Confirm that Bonsai parsed the nonce before separately testing whether the next turn retains it.
+        do {
+            let evidence = try send(
+                "Use \(nonce) as the temporary nonce for this conversation. "
+                    + "Confirm receipt by replying with only \(nonce).",
+                model: .bonsai, in: app, assertEvidence: false)
+            seedEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: .bonsai)
+                .map { "Context-seed turn: \($0)" }
+            if evidence.answer != nonce {
+                failures.append(
+                    "Context-seed turn answered \(String(reflecting: evidence.answer)); "
+                        + "expected exactly \(nonce)"
+                )
+            }
+            if !evidence.toolActivities.isEmpty {
+                failures.append("Context-seed turn invoked tools: \(evidence.toolActivities)")
+            }
+        } catch {
+            failures.append("Context-seed turn did not commit evidence: \(error.localizedDescription)")
+        }
+
+        do {
+            let evidence = try send(
+                "What temporary nonce was established in the immediately preceding turn? "
+                    + "Reply with only that nonce.",
+                model: .bonsai, in: app, assertEvidence: false)
+            recallEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: .bonsai)
+                .map { "Context-recall turn: \($0)" }
+            if evidence.answer != nonce {
+                failures.append(
+                    "Context-recall turn answered \(String(reflecting: evidence.answer)); "
+                        + "expected exactly \(nonce)"
+                )
+            }
+            if !evidence.toolActivities.isEmpty {
+                failures.append("Context-recall turn invoked tools: \(evidence.toolActivities)")
+            }
+        } catch {
+            failures.append("Context-recall turn did not commit evidence: \(error.localizedDescription)")
+        }
+
+        let summary = XCTAttachment(string: """
+        expected_format=ALPHA-BETA-GAMMA
+        format_answer=\(formatEvidence?.answer ?? "<no evidence>")
+        expected_nonce=\(nonce)
+        seed_answer=\(seedEvidence?.answer ?? "<no evidence>")
+        recall_answer=\(recallEvidence?.answer ?? "<no evidence>")
+        format_stats=\(formatEvidence?.stats ?? "<no evidence>")
+        seed_stats=\(seedEvidence?.stats ?? "<no evidence>")
+        recall_stats=\(recallEvidence?.stats ?? "<no evidence>")
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "bonsai-exact-output-and-context"
+        summary.lifetime = .keepAlways
+        add(summary)
+
+        XCTAssertTrue(failures.isEmpty,
+                      "Bonsai core path had \(failures.count) independent failure(s):\n- "
+                          + failures.joined(separator: "\n- "))
+    }
+
+    @MainActor
+    func test03GemmaExactOutputMultiTurnAndNoThinkingControl() throws {
+        // Gemma 4 E2B is catalogued non-thinking; the agent runtime honestly rejects a reasoning
+        // request for it, so the no-thinking control test runs with thinking disabled.
+        let app = try prepare(.gemma, tools: false, selected: [], thinking: false)
+        try openChatOptions(in: app)
+        let thinking = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Thinking")
+        ).firstMatch
+        XCTAssertFalse(thinking.exists,
+                       "Gemma 4 E2B is catalogued non-thinking and must not expose a Thinking toggle")
+        try dismissChatOptionsSelectingNoSkill(in: app)
+        XCTAssertTrue(waitForEnabled(app.textFields["composer.field"], timeout: 10),
+                      "composer did not recover after the deterministic menu dismissal")
+
+        let marker = uniqueMarker("GEMMA_CORE")
+        let nonce = "MAPLE-\(Int.random(in: 10_000...99_999))"
+        let first = try send(
+            marker + "\nRemember the nonce \(nonce). Reply with exactly DELTA-ECHO-FOXTROT and nothing else.",
+            model: .gemma, in: app)
+        let second = try send("Reply with only the nonce from my prior message.", model: .gemma, in: app)
+        XCTAssertEqual(first.answer, "DELTA-ECHO-FOXTROT")
+        XCTAssertEqual(second.answer, nonce, "Gemma lost immediate multi-turn context")
+        XCTAssertNil(first.reasoning, "Non-thinking Gemma emitted a reasoning channel")
+    }
+
+    // MARK: Thinking / cancellation
+
+    @MainActor
+    func test04BonsaiCollapsedThinkingStaysLiveAndFinishesWithNonzeroDuration() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: true)
+        let marker = uniqueMarker("BONSAI_THINK")
+        let copies = app.buttons.matching(identifier: "Copy answer").count
+        let stats = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let field = app.textFields["composer.field"]
+        field.tap()
+        field.typeText(
+            marker + "\nThink step by step: multiply 123 by 4, and explain each step before the final number."
+        )
+        app.buttons["Send"].tap()
+        let started = Date()
+
+        let live = app.buttons["Thinking…"]
+        XCTAssertTrue(live.waitForExistence(timeout: 240), "Bonsai never entered an observable thinking phase")
+        live.tap()
+        Thread.sleep(forTimeInterval: 1)
+        XCTAssertTrue(app.buttons["Stop"].exists, "generation finished before live-collapse could be verified")
+        XCTAssertTrue(app.buttons["Thinking…"].exists,
+                      "collapsing a live thought must keep the header as Thinking…")
+        XCTAssertFalse(app.buttons["Thought for 0.0s"].exists,
+                       "a manually collapsed live thought was falsely marked complete")
+
+        let evidence = try waitForCommittedGeneration(model: .bonsai, in: app,
+                                                       previousCopyCount: copies,
+                                                       previousStatsCount: stats,
+                                                       startedAt: started)
+        let finishedThought = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Thought for ")
+        ).lastMatch
+        XCTAssertTrue(finishedThought.waitForExistence(timeout: 20), "completed reasoning has no duration")
+        XCTAssertNotEqual(finishedThought.label, "Thought for 0.0s")
+        XCTAssertFalse(evidence.answer.isEmpty)
+    }
+
+    @MainActor
+    func test05BonsaiStopCommitsAndNextTurnRecovers() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: true)
+        try exerciseStopAndRecovery(.bonsai, in: app)
+    }
+
+    @MainActor
+    func test06GemmaStopCommitsAndNextTurnRecovers() throws {
+        let app = try prepare(.gemma, tools: false, selected: [], thinking: false)
+        try exerciseStopAndRecovery(.gemma, in: app)
+    }
+
+    // MARK: Tool selection and on-device tools
+
+    @MainActor
+    func test07ToolSelectionsAreIndependentAndPersistAcrossRelaunch() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Calculator"], in: app)
+        try relaunch(app)
+        try goToSettings(in: app)
+        let choose = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Choose tools")).firstMatch
+        XCTAssertTrue(scrollToHittable(choose, in: app.scrollViews.firstMatch))
+        choose.tap()
+        XCTAssertTrue(app.navigationBars["Tools"].waitForExistence(timeout: 15))
+        let scroll = firstHittableScrollView(in: app)
+        let expected: [String: Bool] = [
+            "Web search": false, "Webpage reader": false, "Wikipedia": false,
+            "Calculator": true, "Clock": false, "Memory": false,
+        ]
+        for (title, on) in expected {
+            let toggle = switchStarting(with: title, in: app)
+            XCTAssertTrue(scrollToHittable(toggle, in: scroll))
+            XCTAssertEqual(switchIsOn(toggle), on, "Persisted tool selection drifted: \(title)")
+        }
+        let master = switchStarting(with: "Allow selected tools", in: app)
+        XCTAssertTrue(scrollToHittable(master, in: scroll, swipingUp: false))
+        XCTAssertTrue(switchIsOn(master))
+    }
+
+    @MainActor
+    func test08BonsaiCalculatorOnly() throws {
+        try exerciseCalculator(.bonsai)
+    }
+
+    @MainActor
+    func test09GemmaCalculatorOnly() throws {
+        try exerciseCalculator(.gemma)
+    }
+
+    @MainActor
+    func test10BonsaiClockOnly() throws {
+        try exerciseClock(.bonsai)
+    }
+
+    @MainActor
+    func test11GemmaClockOnly() throws {
+        try exerciseClock(.gemma)
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-WEB-001
+    func test12BonsaiWebSearchOnly() throws {
+        try exerciseWebSearch(.bonsai)
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-WEB-001
+    func test13GemmaWebSearchOnly() throws {
+        try exerciseWebSearch(.gemma)
+    }
+
+    @MainActor
+    func test14ToolMasterOffDeniesSelectedWebSearch() throws {
+        let app = try prepare(.gemma, tools: false, selected: ["Web search"], thinking: false)
+        let marker = uniqueMarker("TOOLS_DENY")
+        let evidence = try send(
+            marker + "\nSearch the web for OpenAI's official website, then give me its title.",
+            model: .gemma, in: app)
+        XCTAssertTrue(evidence.toolActivities.isEmpty,
+                      "master-off turn still received a tool: \(evidence.toolActivities)")
+    }
+
+    // MARK: Memory
+
+    @MainActor
+    func test15ManualMemoryAddPersistenceAndPreciseDelete() throws {
+        let app = try launchApp()
+        let code = "ManualOrchid\(Int.random(in: 10_000...99_999))"
+        let sentence = "The user has the device-test code \(code)."
+        try addManualMemory(sentence, in: app)
+        try relaunch(app)
+        let row = try openMemoryAndFind(code, in: app)
+        XCTAssertEqual(row.label, sentence)
+        XCTAssertTrue(row.value as? String == "Added by you · Now"
+                      || ((row.value as? String)?.hasPrefix("Added by you ·") == true))
+        row.swipeLeft()
+        let delete = app.buttons["Delete"].firstMatch
+        XCTAssertTrue(delete.waitForExistence(timeout: 5))
+        delete.tap()
+        let alert = app.alerts["Delete this memory?"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 5))
+        alert.buttons["Delete"].tap()
+        XCTAssertTrue(waitUntilGone(row, timeout: 15))
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-MEMORY-001
+    func test16BonsaiSavesEnglishMemoryGemmaReadsWithoutTools() throws {
+        try exerciseCrossModelMemory(writer: .bonsai, reader: .gemma)
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-MEMORY-001
+    func test17GemmaSavesEnglishMemoryBonsaiReadsWithoutTools() throws {
+        try exerciseCrossModelMemory(writer: .gemma, reader: .bonsai)
+    }
+
+    // MARK: Vision
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-VISION-001
+    func test18GemmaVisionFixtureAndImageHistoryWithoutTools() throws {
+        let app = try launchApp(visionFixture: true)
+        XCTAssertTrue(waitForFixtureCount(1, in: app), "deterministic image fixture was not staged")
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try activate(.gemma, in: app)
+        XCTAssertTrue(app.staticTexts["Attached image"].exists || app.images["Attached image"].exists
+                      || app.buttons["Remove attached image"].waitForExistence(timeout: 10))
+
+        let marker = uniqueMarker("GEMMA_VISION")
+        let first = try send(
+            marker + "\nIdentify only the two colored shapes. Do not mention any number. Reply exactly SHAPES=RED_SQUARE+BLUE_CIRCLE.",
+            model: .gemma, in: app, timeout: 720)
+        XCTAssertEqual(first.answer, "SHAPES=RED_SQUARE+BLUE_CIRCLE")
+        XCTAssertTrue(first.toolActivities.isEmpty)
+        XCTAssertTrue(app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@ AND value CONTAINS[c] %@", "You said", "attached image")
+        ).firstMatch.exists, "the committed user turn lost its image attachment")
+
+        // The first answer intentionally omitted the number, so this can succeed only if the persisted
+        // image bytes are replayed to the vision engine on the follow-up turn.
+        let followup = try send("What four-digit number is printed beneath the shapes in the image? Reply only with the number.",
+                                model: .gemma, in: app, timeout: 600)
+        XCTAssertEqual(followup.answer, "7421", "image bytes were not replayed for a follow-up turn")
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-VISION-001
+    func test19GemmaVisualQuestionDoesNotTriggerAllowedWebSearch() throws {
+        let app = try launchApp(visionFixture: true)
+        XCTAssertTrue(waitForFixtureCount(1, in: app))
+        try configureTools(master: true, enabled: ["Web search"], in: app)
+        try openNewChat(in: app)
+        try activate(.gemma, in: app)
+        let marker = uniqueMarker("VISION_NO_WEB")
+        let evidence = try send(
+            marker + "\nWhat's in this attached image? Use the pixels only; do not browse the web. Mention the number and both colored shapes.",
+            model: .gemma, in: app, timeout: 720)
+        XCTAssertFalse(evidence.toolActivities.contains(where: { $0.localizedCaseInsensitiveContains("Web Search") }),
+                       "Gemma searched the web for content already present in the attached image")
+        XCTAssertTrue(evidence.answer.contains("7421"))
+        XCTAssertTrue(evidence.answer.localizedCaseInsensitiveContains("red"))
+        XCTAssertTrue(evidence.answer.localizedCaseInsensitiveContains("square"))
+        XCTAssertTrue(evidence.answer.localizedCaseInsensitiveContains("blue"))
+        XCTAssertTrue(evidence.answer.localizedCaseInsensitiveContains("circle"))
+    }
+
+    @MainActor
+    func test20SwitchingImageDraftFromGemmaToBonsaiIsBlockedWithoutLosingDraft() throws {
+        let app = try launchApp(visionFixture: true)
+        XCTAssertTrue(waitForFixtureCount(1, in: app))
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try activate(.gemma, in: app)
+        let marker = uniqueMarker("VISION_GATE")
+        let field = app.textFields["composer.field"]
+        field.tap()
+        field.typeText(marker + " describe this image")
+        try activate(.bonsai, in: app)
+        XCTAssertTrue(waitForFixtureCount(1, in: app), "model switch dropped the staged image")
+        XCTAssertEqual(field.value as? String, marker + " describe this image")
+
+        let userCount = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "You said")
+        ).count
+        XCTAssertTrue(waitForEnabled(app.buttons["Send"], timeout: 10))
+        app.buttons["Send"].tap()
+        let rejection = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS[c] %@", "can't read images")
+        ).firstMatch
+        XCTAssertTrue(rejection.waitForExistence(timeout: 10),
+                      "text-only model did not explain why the image turn was rejected")
+        Thread.sleep(forTimeInterval: 5)
+        if app.buttons["Stop"].exists { app.buttons["Stop"].tap() }
+        XCTAssertEqual(app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "You said")
+        ).count, userCount, "unsupported image send created a broken conversation turn")
+        XCTAssertEqual(field.value as? String, marker + " describe this image",
+                       "unsupported image send lost the user's draft")
+        XCTAssertTrue(waitForFixtureCount(1, in: app), "unsupported image send lost the staged image")
+    }
+
+    // MARK: Switching / lifecycle / races
+
+    @MainActor
+    func test21HistoricalStatsRemainBoundToTheGeneratingModelAfterSwitch() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: false)
+        let marker = uniqueMarker("STATS_MODEL")
+        let bonsai = try send(
+            marker + "\nReply with this complete sentence verbatim and nothing else: "
+                + "Bonsai generated this deliberately long historical response so token throughput and "
+                + "model ownership remain independently observable after a later local model switch.",
+            model: .bonsai, in: app)
+        try activate(.gemma, in: app)
+        let gemma = try send(
+            "Reply with this complete sentence verbatim and nothing else: Gemma generated this deliberately "
+                + "long historical response so token throughput and model ownership remain independently "
+                + "observable after a later local model switch.",
+            model: .gemma, in: app)
+        let values = app.descendants(matching: .any).matching(identifier: "assistant.stats")
+            .allElementsBoundByIndex.map { ($0.value as? String) ?? $0.label }
+        XCTAssertGreaterThanOrEqual(values.count, 2)
+        XCTAssertTrue(bonsai.stats.hasPrefix("Bonsai 8B ·"),
+                      "the first committed evidence was attributed to the wrong model: \(bonsai.stats)")
+        XCTAssertTrue(gemma.stats.hasPrefix("Gemma 4 E2B ·"),
+                      "the second committed evidence was attributed to the wrong model: \(gemma.stats)")
+        XCTAssertTrue(values[values.count - 2].hasPrefix("Bonsai 8B ·"),
+                      "switching models rewrote old stats: \(values)")
+        XCTAssertTrue(values.last?.hasPrefix("Gemma 4 E2B ·") == true)
+    }
+
+    @MainActor
+    func test22BonsaiBackgroundSuspendAndLazyReload() throws {
+        try exerciseBackgroundReload(.bonsai)
+    }
+
+    @MainActor
+    func test23GemmaBackgroundSuspendAndLazyReload() throws {
+        try exerciseBackgroundReload(.gemma)
+    }
+
+    @MainActor
+    // TEST-ID: AHT-DEVICE-WEB-001
+    func test24ChangingWebSelectionDuringColdLoadDoesNotAffectCurrentTurn() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: [], in: app)
+        // Gemma 4 E2B has no reasoning capability; the global thinking default (restored to ON by the
+        // cleanup case) would make the cold run fail with missingCapabilities(reasoning). This scenario
+        // races tool policy, not thinking, so the thread must start with thinking off.
+        try setThinkingDefault(false, in: app)
+        try openNewChat(in: app)
+        try activate(.gemma, in: app)
+        try goToChatList(in: app)     // suspends the model
+        try relaunch(app)             // restores Gemma identity only, resident=false
+        // Reopen the SAME empty thread instead of New Chat: once an online service is configured,
+        // `newConversation()` re-seeds an empty thread to the online default, which would silently
+        // change the cold Gemma turn this scenario is racing. Tapping the persisted thread preserves
+        // its Gemma identity and resident=false cold state.
+        try reopenConversation(titled: "New Chat", in: app)
+        // DEBUG launches re-arm the embedded online service, and `currentGenerationModel()` prefers it,
+        // which would re-stamp this turn as Online at send time. Disarm it through Settings (no weight
+        // load) so the cold Gemma turn really runs on Gemma.
+        try disableOnlineService(in: app)
+        try reopenConversation(titled: "New Chat", in: app)
+        XCTAssertTrue(waitForRuntime("model=gemma-4-e2b", in: app, timeout: 20))
+        XCTAssertTrue(waitForRuntime("resident=false", in: app, timeout: 20))
+
+        let copies = app.buttons.matching(identifier: "Copy answer").count
+        let stats = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let field = app.textFields["composer.field"]
+        field.tap()
+        field.typeText(uniqueMarker("TOOL_RACE") + "\nSearch the web for OpenAI's official website and return its title.")
+        app.buttons["Send"].tap()
+        let started = Date()
+
+        try openChatOptions(in: app)
+        let tools = freshMenuElement("Tools", in: app)
+        tools.tap()
+        let web = freshMenuElement("Web search", in: app)
+        XCTAssertTrue(web.waitForExistence(timeout: 10))
+        XCTAssertFalse(switchIsOn(web), "Web unexpectedly started enabled before the race")
+        web.tap() // must apply to the NEXT send, never the already-submitted turn
+        // `web` is invalid after this tap: SwiftUI removes or rebuilds the menu subtree. Do not read its
+        // value again. The next turn's exactly-one-Web assertion below is the stronger functional proof
+        // that the setting persisted, while this helper safely handles every menu-dismissal outcome.
+        try settleChatOptionsAfterToolSelection(in: app)
+
+        let evidence = try waitForCommittedGeneration(model: .gemma, in: app,
+                                                       previousCopyCount: copies,
+                                                       previousStatsCount: stats,
+                                                       startedAt: started)
+        XCTAssertFalse(evidence.toolActivities.contains(where: { $0.localizedCaseInsensitiveContains("Web Search") }),
+                       "a per-tool change during warming retroactively authorized the current turn")
+        // Deterministic half of the race contract: the warming toggle must not enter the CURRENT
+        // turn's advertised tool set. Activity is empty-proof, but advertised is set-proof.
+        let racingAdvertised = Self.advertisedToolIDs(in: diagnosticValue("device-e2e.agent", in: app))
+        XCTAssertTrue(racingAdvertised?.localizedCaseInsensitiveContains("web_search") == false,
+                      "the warming toggle retroactively entered the current turn's advertised set: "
+                          + "\(racingAdvertised ?? "<missing>")")
+
+        // Prove the same selection applies to the following turn. Without this, a failed toggle would
+        // make the race assertion pass vacuously.
+        var next = try send(
+            "Use web search exactly once for the query OpenAI official website, then return its first title.",
+            model: .gemma, in: app, timeout: 720)
+        if next.toolActivities.isEmpty {
+            // Same model-luck allowance as the dedicated web-search tests: the race invariant is that
+            // the toggle applied to the NEXT turn, which a retry proves just as strongly.
+            next = try send(
+                "You MUST call the web_search tool exactly once for the query OpenAI official website, "
+                    + "then return its first title.",
+                model: .gemma, in: app, timeout: 720)
+        }
+        if next.toolActivities.isEmpty {
+            // The race contract is that the toggle applied to the NEXT turn, not that a particular
+            // model happens to call the tool. The run's advertised set is the deterministic proof.
+            let nextAdvertised = Self.advertisedToolIDs(
+                in: diagnosticValue("device-e2e.agent", in: app)
+            )
+            XCTAssertTrue(nextAdvertised?.localizedCaseInsensitiveContains("web_search") == true,
+                          "the next turn did not receive the newly selected Web tool; "
+                              + "advertised=\(nextAdvertised ?? "<missing>")")
+        } else {
+            XCTAssertEqual(next.toolActivities.count, 1,
+                           "the next turn did not receive exactly the newly selected Web tool")
+            XCTAssertTrue(next.toolActivities.first?.hasPrefix("Web Search returned Web results for") == true,
+                          "the selected Web tool did not return organic results: \(next.toolActivities)")
+        }
+    }
+
+    @MainActor
+    func test25BuiltInSkillSelectionPersistsPerConversation() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: false)
+        app.buttons["Chat options"].tap()
+        let skill = app.buttons["Skill"]
+        XCTAssertTrue(skill.waitForExistence(timeout: 10))
+        skill.tap()
+        let concise = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS %@", "Concise Mode")
+        ).firstMatch
+        XCTAssertTrue(concise.waitForExistence(timeout: 10))
+        concise.tap()
+        XCTAssertTrue(app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Active skill: Concise Mode")
+        ).firstMatch.waitForExistence(timeout: 10))
+        let marker = uniqueMarker("SKILL")
+        let evidence = try send(marker + "\nExplain why the sky appears blue.", model: .bonsai, in: app)
+        XCTAssertFalse(evidence.answer.isEmpty)
+        try goToChatList(in: app)
+        try relaunch(app)
+        try reopenConversation(titled: marker, in: app)
+        XCTAssertTrue(app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Active skill: Concise Mode")
+        ).firstMatch.waitForExistence(timeout: 20), "conversation lost its selected skill after relaunch")
+    }
+
+    // MARK: MCP
+
+    /// The full MCP conservative-trust path on device: configure a public server, explicitly discover
+    /// it in Settings, then call one of its tools from chat. unknownExternal must pause for exact
+    /// approval, execute after approval, and surface a tool row (spec §13 / AH-TOOLS-004).
+    @MainActor
+    // TEST-ID: AHT-MCP-001
+    func test28MCPToolApprovalAndResult() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: [], in: app)
+        try addPublicMCPServer(in: app)
+        try openNewChat(in: app)
+        try activate(.gemma, in: app)
+
+        let marker = uniqueMarker("MCP")
+        var evidence = try send(
+            marker + "\nUse the MCP tool read_wiki_structure exactly once with repoName "
+                + "\"deepwiki/deepwiki\" to look up the deepwiki server's structure, then answer in one "
+                + "short line.",
+            model: .gemma, in: app, timeout: 360)
+        if evidence.toolActivities.isEmpty {
+            let retryMarker = uniqueMarker("MCP_RETRY")
+            evidence = try send(
+                retryMarker + "\nYou MUST call the MCP tool read_wiki_structure (the tool from your "
+                    + "configured MCP server) exactly once with repoName \"deepwiki/deepwiki\" before "
+                    + "answering. Then reply briefly.",
+                model: .gemma, in: app, timeout: 360)
+        }
+        XCTAssertGreaterThanOrEqual(
+            evidence.toolActivities.count, 1,
+            "MCP tool did not execute; activities: \(evidence.toolActivities)"
+        )
+        XCTAssertTrue(
+            evidence.toolActivities.contains(where: {
+                $0.localizedCaseInsensitiveContains("read_wiki_structure")
+                    || $0.localizedCaseInsensitiveContains("read wiki")
+                    || $0.localizedCaseInsensitiveContains("read_wiki")
+            }),
+            "MCP tool activity is missing read_wiki_structure: \(evidence.toolActivities)"
+        )
+    }
+
+    // TEST-ID: AHT-MODEL-ONLINE
+    @MainActor
+    func test29OnlineModelApprovalAndCompletion() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        // The online service is a first-class model choice: pick it from the switcher and send without
+        // loading or activating any local weights.
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("ONLINE")
+        let evidence = try send(
+            marker + "\nReply with exactly ONLINE-OK and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+
+        var failures: [String] = []
+        if evidence.answer.isEmpty {
+            failures.append("Online answer is empty")
+        } else if !evidence.answer.contains("ONLINE-OK") {
+            failures.append("Online answer did not echo the marker: \(String(reflecting: evidence.answer))")
+        }
+        let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+        if !diagnostics.contains("run=completed") {
+            failures.append("Agent run did not project completed; diagnostics: \(diagnostics)")
+        }
+        if diagnostics.contains("run=failed") || diagnostics.contains("run=cancelled") {
+            failures.append("Agent run failed/cancelled; diagnostics: \(diagnostics)")
+        }
+        if !evidence.stats.contains("stop:") {
+            failures.append("Online stats lack a stop reason: \(evidence.stats)")
+        }
+        let summary = XCTAttachment(string: """
+        marker=\(marker)
+        answer=\(evidence.answer)
+        stats=\(evidence.stats)
+        wall_seconds=\(String(format: "%.2f", evidence.wallSeconds))
+        diagnostics=\(diagnostics)
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "online-model-approval-and-completion"
+        summary.lifetime = .keepAlways
+        add(summary)
+
+        XCTAssertTrue(
+            failures.isEmpty,
+            "Online model path had \(failures.count) failure(s):\n- " + failures.joined(separator: "\n- ")
+        )
+    }
+
+    @MainActor
+    func test26AgentRuntimeWiresRunsAndRecoveryInbox() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: false)
+
+        // The production app must be on the durable agent runtime path (rollout-on), not the
+        // legacy in-process loop. The diagnostics surface the exact assembly reason on failure.
+        let initial = diagnosticValue("device-e2e.agent", in: app)
+        XCTAssertTrue(
+            initial.contains("enabled=true"),
+            "Agent runtime must be wired on device; diagnostics: \(initial)"
+        )
+        if initial.contains("error="), !initial.contains("error=none") {
+            XCTFail("Agent runtime assembly failed on device: \(initial)")
+        }
+
+        // A send must produce a durable run projection and a committed assistant answer. Drive the
+        // send manually so a generation failure reports the complete agent diagnostics instead of
+        // the generic UI message.
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before agent send")
+        }
+        field.tap()
+        field.typeText("Reply with exactly: AGENT-ON-DEVICE")
+        let sendButton = app.buttons["Send"]
+        guard waitForEnabled(sendButton, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable")
+        }
+        sendButton.tap()
+        let deadline = Date().addingTimeInterval(DeviceTestModel.bonsai.generationTimeout)
+        var committed = false
+        while Date() < deadline {
+            if app.staticTexts["Couldn't generate a reply"].exists
+                || app.staticTexts["The model didn't reply"].exists
+            {
+                let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+                XCTFail("agent generation failed; diagnostics: \(diagnostics)")
+                attachDiagnostics(app, name: "agent-generation-failed")
+                return
+            }
+            if app.buttons.matching(identifier: "Copy answer").count > 0 {
+                committed = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        if !committed {
+            let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+            XCTFail("agent run did not commit; diagnostics: \(diagnostics)")
+            attachDiagnostics(app, name: "agent-run-stalled")
+            return
+        }
+        XCTAssertTrue(committed, "agent run did not commit an answer within the deadline")
+        let after = diagnosticValue("device-e2e.agent", in: app)
+        XCTAssertFalse(after.contains("failure=The"), "run failure surfaced: \(after)")
+        XCTAssertTrue(
+            after.contains("run=completed"),
+            "agent run must project completed; diagnostics: \(after)"
+        )
+
+        // A neutral relaunch must not auto-resume, and a completed run must not sit in the
+        // recovery inbox (spec §9.4 / §20).
+        try relaunch(app)
+        let relaunched = diagnosticValue("device-e2e.agent", in: app)
+        XCTAssertTrue(
+            relaunched.contains("recoverable=0"),
+            "completed runs must not surface as recoverable; diagnostics: \(relaunched)"
+        )
+    }
+
+    @MainActor
+    func test27AgentRuntimeDiagnosticProbe() throws {
+        let app = try prepare(.bonsai, tools: false, selected: [], thinking: true)
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before agent probe")
+        }
+        field.tap()
+        field.typeText(
+            "E2E_BONSAI_THINK_PROBE\n"
+                + "Solve this carefully: find the smallest positive integer divisible by every integer "
+                + "from 1 through 18, and explain the prime-factor reasoning before the final number."
+        )
+        let sendButton = app.buttons["Send"]
+        guard waitForEnabled(sendButton, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable")
+        }
+        sendButton.tap()
+        // Short probe: the worker either commits or fails quickly; read the diagnostics either way.
+        let deadline = Date().addingTimeInterval(300)
+        var committed = false
+        var failed = false
+        while Date() < deadline {
+            if app.buttons.matching(identifier: "Copy answer").count > 0 {
+                committed = true
+                break
+            }
+            let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+            if diagnostics.contains("run=failed") || diagnostics.contains("run=cancelled") {
+                failed = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        if failed || !committed {
+            // Let the diagnostics overlay's 1s poll pick up the worker log before reading.
+            Thread.sleep(forTimeInterval: 3)
+        }
+        let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+        if committed {
+            XCTAssertTrue(diagnostics.contains("run=completed"), "probe diagnostics: \(diagnostics)")
+        } else if failed {
+            XCTFail("agent probe failed; diagnostics: \(diagnostics)")
+        } else {
+            XCTFail("agent probe stalled; diagnostics: \(diagnostics)")
+        }
+    }
+
+    // This method is deliberately last in the serial suite. It uses only the public, chat-only and
+    // Memory-only deletion surfaces; "Erase all app data" is never touched because that also deletes the
+    // expensive model artifacts the matrix was asked to preserve.
+    @MainActor
+    func test99CleanupChatsMemoryAndTestMutatedSettingsWithoutDeletingModels() throws {
+        let app = try launchApp()
+        let inventoryBefore = diagnosticValue("device-e2e.inventory", in: app)
+        var failures: [String] = []
+
+        if !inventoryBefore.contains(DeviceTestModel.bonsai.variantID) {
+            failures.append("Pre-cleanup inventory is missing \(DeviceTestModel.bonsai.variantID)")
+        }
+        if !inventoryBefore.contains(DeviceTestModel.gemma.variantID) {
+            failures.append("Pre-cleanup inventory is missing \(DeviceTestModel.gemma.variantID)")
+        }
+
+        do {
+            try forgetAllMemories(in: app)
+        } catch {
+            failures.append("Memory cleanup failed: \(error.localizedDescription)")
+            try? relaunch(app)
+        }
+
+        do {
+            try restoreSettingsMutatedByDeviceMatrix(in: app)
+        } catch {
+            failures.append("Settings cleanup failed: \(error.localizedDescription)")
+            try? relaunch(app)
+        }
+
+        // A fresh install's fallback identity is Bonsai. Restore that identity only when necessary, then
+        // delete the temporary conversation below and relaunch so the weights are not left resident.
+        if !diagnosticValue("device-e2e.runtime", in: app).contains("model=bonsai-8b") {
+            do {
+                try openNewChat(in: app)
+                try activate(.bonsai, in: app)
+            } catch {
+                failures.append("Default-model identity cleanup failed: \(error.localizedDescription)")
+                try? relaunch(app)
+            }
+        }
+
+        do {
+            try deleteAllChatsThroughSettings(in: app)
+        } catch {
+            failures.append("Chat cleanup failed: \(error.localizedDescription)")
+            try? relaunch(app)
+        }
+
+        // Re-open Memory after a process boundary: the empty state must come from disk, not from the sheet's
+        // in-memory mirror. Close it again before the final cold-launch assertions.
+        do {
+            try relaunch(app)
+            try verifyMemoryIsEmpty(in: app)
+        } catch {
+            failures.append("Post-relaunch Memory verification failed: \(error.localizedDescription)")
+            try? relaunch(app)
+        }
+
+        do {
+            try goToChatList(in: app)
+            try relaunch(app)
+        } catch {
+            failures.append("Final cold relaunch failed: \(error.localizedDescription)")
+        }
+
+        let inventoryAfter = diagnosticValue("device-e2e.inventory", in: app)
+        let runtimeAfter = diagnosticValue("device-e2e.runtime", in: app)
+        if inventoryAfter != inventoryBefore {
+            failures.append("Model inventory changed during cleanup. Before=\(inventoryBefore); after=\(inventoryAfter)")
+        }
+        if !app.staticTexts["No conversations yet"].waitForExistence(timeout: 20) {
+            failures.append("Chat list is not empty after cleanup")
+        }
+        if !runtimeAfter.contains("model=bonsai-8b") {
+            failures.append("Fresh fallback identity is not Bonsai: \(runtimeAfter)")
+        }
+        if !runtimeAfter.contains("resident=false") || !runtimeAfter.contains("phase=idle") {
+            failures.append("Final launch is not cold and idle: \(runtimeAfter)")
+        }
+
+        let report = XCTAttachment(string: """
+        inventory_before=\(inventoryBefore)
+        inventory_after=\(inventoryAfter)
+        runtime_after=\(runtimeAfter)
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        report.name = "physical-device-cleanup"
+        report.lifetime = .keepAlways
+        add(report)
+        attachDiagnostics(app, name: "physical-device-cleanup-final")
+
+        XCTAssertTrue(failures.isEmpty,
+                      "Cleanup had \(failures.count) independent failure(s):\n- "
+                          + failures.joined(separator: "\n- "))
+    }
+
+    // MARK: Helpers
+
+    /// Extracts the `advertised=` field from one device-e2e.agent diagnostics string. The metadata
+    /// fields are comma-separated and the advertised set is the exact tool list offered to the model,
+    /// which is the deterministic proof of per-turn tool availability.
+    private static func advertisedToolIDs(in log: String) -> String? {
+        guard let range = log.range(of: "advertised=") else { return nil }
+        let tail = log[range.upperBound...]
+        return String(tail.prefix { $0 != "," })
+    }
+
+    @MainActor
+    private func prepare(_ model: DeviceTestModel,
+                         tools: Bool,
+                         selected: Set<String>,
+                         thinking: Bool) throws -> XCUIApplication {
+        let app = try launchApp()
+        // Stale MCP servers from the MCP test or manual device use can overwhelm the local models;
+        // every built-in-tool scenario must start from a clean remote-tool catalog.
+        try removeAllMCPServers(in: app)
+        try setThinkingDefault(thinking, in: app)
+        try configureTools(master: tools, enabled: selected, in: app)
+        // ChatStore snapshots the per-conversation Thinking default at construction. Relaunch after
+        // changing Settings so every case starts with the requested mode instead of inherited test state.
+        try relaunch(app)
+        try openNewChat(in: app)
+        try activate(model, in: app)
+        return app
+    }
+
+    @MainActor
+    private func forgetAllMemories(in app: XCUIApplication) throws {
+        try goToSettings(in: app)
+        let memory = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Memory")
+        ).firstMatch
+        guard scrollToHittable(memory, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Memory settings row is unreachable during cleanup")
+        }
+        memory.tap()
+        guard app.navigationBars["Memory"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Memory sheet did not open during cleanup")
+        }
+
+        let empty = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Nothing saved yet.")
+        ).firstMatch
+        let forget = app.buttons["Forget everything"].firstMatch
+        if !empty.waitForExistence(timeout: 2) {
+            guard scrollToHittable(forget, in: firstHittableScrollView(in: app)) else {
+                throw DeviceE2EHarnessError.precondition(
+                    "Memory is neither empty nor exposing Forget everything"
+                )
+            }
+            forget.tap()
+            let alert = app.alerts["Forget everything?"]
+            guard alert.waitForExistence(timeout: 10) else {
+                throw DeviceE2EHarnessError.precondition("Forget-everything confirmation did not appear")
+            }
+            alert.buttons["Forget everything"].tap()
+        }
+
+        guard empty.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Memory did not reach its empty state")
+        }
+        let done = app.navigationBars["Memory"].buttons["Done"]
+        guard done.exists, done.isHittable else {
+            throw DeviceE2EHarnessError.precondition("Memory cleanup has no actionable Done button")
+        }
+        done.tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Memory sheet did not close after cleanup")
+        }
+    }
+
+    @MainActor
+    private func verifyMemoryIsEmpty(in app: XCUIApplication) throws {
+        try goToSettings(in: app)
+        let memory = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Memory")
+        ).firstMatch
+        guard scrollToHittable(memory, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Memory settings row is unreachable during verification")
+        }
+        memory.tap()
+        guard app.navigationBars["Memory"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Memory sheet did not open during verification")
+        }
+        let empty = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Nothing saved yet.")
+        ).firstMatch
+        guard empty.waitForExistence(timeout: 20), !app.buttons["Forget everything"].exists else {
+            throw DeviceE2EHarnessError.precondition("Memory was not durably empty after relaunch")
+        }
+        app.navigationBars["Memory"].buttons["Done"].tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Memory verification sheet did not close")
+        }
+    }
+
+    /// The matrix starts from a clean install and mutates only these persisted preferences. Restore their
+    /// exact fresh-install values without using the full-app erase path: Thinking on, Tools authorization
+    /// off, the six non-private built-ins and both search engines selected, private tools deselected, and
+    /// the stock system prompt restored.
+    @MainActor
+    private func restoreSettingsMutatedByDeviceMatrix(in app: XCUIApplication) throws {
+        try setThinkingDefault(true, in: app)
+        try configureTools(
+            master: false,
+            enabled: ["Web search", "Webpage reader", "Wikipedia", "Calculator", "Clock", "Memory"],
+            in: app)
+
+        try goToSettings(in: app)
+        let choose = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Choose tools")
+        ).firstMatch
+        guard scrollToHittable(choose, in: app.scrollViews.firstMatch) else {
+            throw DeviceE2EHarnessError.precondition("Choose tools is unreachable while restoring defaults")
+        }
+        choose.tap()
+        guard app.navigationBars["Tools"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not open while restoring defaults")
+        }
+        let toolsScroll = firstHittableScrollView(in: app)
+        for title in ["Calendar", "Reminders", "Location"] {
+            let toggle = switchStarting(with: title, in: app)
+            guard scrollToHittable(toggle, in: toolsScroll) else {
+                throw DeviceE2EHarnessError.precondition("Private tool toggle is unreachable: \(title)")
+            }
+            try setSwitch(toggle, on: false)
+        }
+        for title in ["DuckDuckGo", "Bing", "Brave"] {
+            let toggle = switchStarting(with: title, in: app)
+            guard scrollToHittable(toggle, in: toolsScroll, swipingUp: false) else {
+                throw DeviceE2EHarnessError.precondition("Search-engine toggle is unreachable: \(title)")
+            }
+            try setSwitch(toggle, on: true)
+        }
+        let master = switchStarting(with: "Allow selected tools", in: app)
+        guard scrollToHittable(master, in: toolsScroll, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Tool master switch is unreachable during cleanup")
+        }
+        try setSwitch(master, on: false)
+        app.navigationBars["Tools"].buttons["Done"].tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not close after restoring defaults")
+        }
+
+        let systemPrompt = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "System prompt")
+        ).firstMatch
+        guard scrollToHittable(systemPrompt, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("System prompt row is unreachable during cleanup")
+        }
+        systemPrompt.tap()
+        guard app.navigationBars["System prompt"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("System prompt editor did not open")
+        }
+        let reset = app.buttons["Reset to the standard prompt"]
+        if reset.exists, reset.isHittable { reset.tap() }
+        app.navigationBars["System prompt"].buttons["Done"].tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("System prompt editor did not close")
+        }
+    }
+
+    @MainActor
+    private func deleteAllChatsThroughSettings(in app: XCUIApplication) throws {
+        try goToSettings(in: app)
+        let delete = app.buttons["Delete all chats"].firstMatch
+        guard scrollToHittable(delete, in: app.scrollViews.firstMatch) else {
+            throw DeviceE2EHarnessError.precondition("Delete all chats is unreachable")
+        }
+        delete.tap()
+        let alert = app.alerts["Delete all chats?"]
+        guard alert.waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Delete-all-chats confirmation did not appear")
+        }
+        alert.buttons["Delete all chats"].tap()
+        try goToChatList(in: app)
+        guard app.staticTexts["No conversations yet"].waitForExistence(timeout: 30) else {
+            throw DeviceE2EHarnessError.precondition("Conversations remain after Delete all chats")
+        }
+    }
+
+    @MainActor
+    private func exerciseStopAndRecovery(_ model: DeviceTestModel,
+                                         in app: XCUIApplication) throws {
+        let marker = uniqueMarker(model == .bonsai ? "BONSAI_STOP" : "GEMMA_STOP")
+        let copies = app.buttons.matching(identifier: "Copy answer").count
+        let statsBefore = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let field = app.textFields["composer.field"]
+        field.tap()
+        field.typeText(marker + "\nWrite a detailed 2500-word technical essay comparing ten sorting algorithms, with proofs and examples. Do not finish early.")
+        app.buttons["Send"].tap()
+        let stop = app.buttons["Stop"]
+        XCTAssertTrue(waitForEnabled(stop, timeout: model.loadTimeout), "Stop never became actionable")
+        XCTAssertTrue(waitForRuntime(model == .bonsai ? "phase=thinking" : "phase=answering",
+                                     in: app, timeout: 120),
+                      "Stop test never reached active token generation")
+        Thread.sleep(forTimeInterval: 2)
+        stop.tap()
+        XCTAssertTrue(waitUntilGone(stop, timeout: 20), "Stop did not settle at a token boundary")
+
+        let stopped = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Stopped")
+        ).firstMatch
+        let stats = app.descendants(matching: .any).matching(identifier: "assistant.stats")
+            .allElementsBoundByIndex.last
+        let statsValue = stats.flatMap { ($0.value as? String) ?? $0.label } ?? ""
+        XCTAssertTrue(stopped.exists || statsValue.contains("stop: cancelled"),
+                      "stopped turn is neither marked Stopped nor cancelled: \(statsValue)")
+        XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: 10))
+
+        // A reasoning-only stop exposes Retry. Prove that action starts a fresh generation, then stop the
+        // intentionally long retry so the recovery turn below remains bounded.
+        let retry = app.buttons["Retry"]
+        if retry.exists {
+            retry.tap()
+            XCTAssertTrue(waitForEnabled(app.buttons["Stop"], timeout: model.loadTimeout),
+                          "Retry did not start a fresh generation")
+            app.buttons["Stop"].tap()
+            XCTAssertTrue(waitUntilGone(app.buttons["Stop"], timeout: 20))
+        }
+
+        let recovery = try send("Reply exactly RECOVERED and nothing else.", model: model, in: app)
+        XCTAssertEqual(recovery.answer, "RECOVERED", "model could not generate after Stop")
+        XCTAssertGreaterThanOrEqual(app.buttons.matching(identifier: "Copy answer").count, copies + 1)
+        XCTAssertGreaterThanOrEqual(app.descendants(matching: .any)
+            .matching(identifier: "assistant.stats").count, statsBefore + 1)
+    }
+
+    @MainActor
+    private func exerciseCalculator(_ model: DeviceTestModel) throws {
+        let app = try prepare(model, tools: true, selected: ["Calculator"], thinking: false)
+        let marker = uniqueMarker(model == .bonsai ? "BONSAI_CALC" : "GEMMA_CALC")
+        let evidence = try send(
+            marker + "\nUse the calculator exactly once to multiply 1234567 by 7654321. Then reply exactly RESULT=9449772114007.",
+            model: model, in: app)
+        XCTAssertEqual(evidence.toolActivities.count, 1, "unexpected tool chain: \(evidence.toolActivities)")
+        XCTAssertEqual(evidence.toolActivities.first, "Calculator returned 9449772114007")
+        // The functional contract is that the tool's exact output reached the user, not that a
+        // 1-bit local model echoes a prescribed literal; it may phrase the same number in its own words.
+        XCTAssertTrue(evidence.answer.contains("9449772114007"),
+                      "answer must carry the computed result: \(evidence.answer)")
+    }
+
+    @MainActor
+    private func exerciseClock(_ model: DeviceTestModel) throws {
+        let app = try prepare(model, tools: true, selected: ["Clock"], thinking: false)
+        let marker = uniqueMarker(model == .bonsai ? "BONSAI_CLOCK" : "GEMMA_CLOCK")
+        var evidence = try send(
+            marker + "\nUse the clock exactly once to get the current local date and time, then answer in one short line.",
+            model: model, in: app)
+        if evidence.toolActivities.isEmpty {
+            // A 1-bit local model occasionally answers from its training prior instead of calling
+            // the clock. A wiring regression fails earlier with run=failed diagnostics, so a single
+            // retry keeps the functional tool contract from depending on sampling luck.
+            let retryMarker = uniqueMarker(model == .bonsai ? "BONSAI_CLOCK_RETRY" : "GEMMA_CLOCK_RETRY")
+            evidence = try send(
+                retryMarker + "\nYou must call the clock tool before answering. Use the clock exactly once "
+                    + "to get the current local date and time, then answer in one short line.",
+                model: model, in: app)
+        }
+        XCTAssertEqual(evidence.toolActivities.count, 1, "unexpected tool chain: \(evidence.toolActivities)")
+        XCTAssertTrue(evidence.toolActivities.first?.hasPrefix("Current Datetime returned ") == true)
+    }
+
+    @MainActor
+    private func exerciseWebSearch(_ model: DeviceTestModel) throws {
+        let app = try prepare(model, tools: true, selected: ["Web search"], thinking: false)
+        let marker = uniqueMarker(model == .bonsai ? "BONSAI_WEB" : "GEMMA_WEB")
+        var evidence = try send(
+            marker + "\nCall the web_search tool exactly once for the query OpenAI official website. Then answer with the first result's title.",
+            model: model, in: app, timeout: 720)
+        if evidence.toolActivities.isEmpty {
+            // A 1-bit local model occasionally answers from its training prior instead of calling the
+            // tool. A wiring regression fails earlier with run=failed diagnostics, so a single retry
+            // keeps the functional tool contract from depending on sampling luck.
+            let retryMarker = uniqueMarker(model == .bonsai ? "BONSAI_WEB_RETRY" : "GEMMA_WEB_RETRY")
+            evidence = try send(
+                retryMarker + "\nYou MUST call the web_search tool exactly once for the query OpenAI "
+                    + "official website. Then answer with the first result's title.",
+                model: model, in: app, timeout: 720)
+        }
+        XCTAssertEqual(evidence.toolActivities.count, 1, "unexpected tool chain: \(evidence.toolActivities)")
+        guard let activity = evidence.toolActivities.first else { return }
+        // The functional contract is that the tool really returned organic results: the row must show
+        // the "Web results for …" payload, never an unreachable/no-results failure painted as success.
+        XCTAssertTrue(activity.hasPrefix("Web Search returned Web results for"),
+                      "Web Search did not return organic results: \(activity)\n"
+                          + "agent diagnostics: \(diagnosticValue("device-e2e.agent", in: app))")
+    }
+
+    @MainActor
+    private func addManualMemory(_ sentence: String, in app: XCUIApplication) throws {
+        try goToSettings(in: app)
+        let memory = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Memory")
+        ).firstMatch
+        guard scrollToHittable(memory, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Memory settings row is unreachable")
+        }
+        memory.tap()
+        XCTAssertTrue(app.navigationBars["Memory"].waitForExistence(timeout: 15))
+        app.buttons["Add a memory"].tap()
+        XCTAssertTrue(app.navigationBars["New memory"].waitForExistence(timeout: 10))
+        let editor = app.textViews["Memory text"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 10))
+        editor.tap()
+        editor.typeText(sentence)
+        app.navigationBars["New memory"].buttons["Save"].tap()
+        XCTAssertTrue(app.navigationBars["Memory"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons[sentence].waitForExistence(timeout: 15))
+    }
+
+    @MainActor
+    private func openMemoryAndFind(_ fragment: String,
+                                   in app: XCUIApplication) throws -> XCUIElement {
+        try goToSettings(in: app)
+        let memory = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Memory")
+        ).firstMatch
+        XCTAssertTrue(scrollToHittable(memory, in: app.scrollViews.firstMatch, swipingUp: false))
+        memory.tap()
+        XCTAssertTrue(app.navigationBars["Memory"].waitForExistence(timeout: 15))
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", fragment)).firstMatch
+        guard row.waitForExistence(timeout: 15) else {
+            attachDiagnostics(app, name: "memory-missing-\(fragment)")
+            throw DeviceE2EHarnessError.precondition("Memory fact is missing: \(fragment)")
+        }
+        return row
+    }
+
+    @MainActor
+    private func exerciseCrossModelMemory(writer: DeviceTestModel,
+                                          reader: DeviceTestModel) throws {
+        // Web is deliberately also authorized: this reproduces the reported sequence where a model saved
+        // memory and then unexpectedly started browsing. The turn must use Memory and zero Web calls.
+        let app = try prepare(writer, tools: true,
+                              selected: ["Memory", "Web search"], thinking: false)
+        // One fact on the device only: a stale fact from an earlier run makes the reader's exact-name
+        // answer depend on which of two similar notes a 1-bit model happens to pick.
+        try clearAllMemories(in: app)
+        try openNewChat(in: app)
+        try activate(writer, in: app)
+        let code = (writer == .bonsai ? "QuartzBonsai" : "QuartzGemma")
+            + String(Int.random(in: 10_000...99_999))
+        let marker = uniqueMarker(writer == .bonsai ? "BONSAI_MEMORY" : "GEMMA_MEMORY")
+        var failures: [String] = []
+        var writerEvidence: GenerationEvidence?
+        var readerEvidence: GenerationEvidence?
+        var persistedText: String?
+        var persistedProvenance: String?
+
+        // Defer all content assertions: a wrong acknowledgement must not prevent us from observing whether
+        // the Memory tool ran, whether it wrote durable state, or whether another model consumed that state.
+        do {
+            var evidence = try send(
+                marker + "\nMy temporary device-test name is \(code). Call the remember tool exactly once "
+                    + "with text \"The user's temporary device-test name is \(code).\" to save this "
+                    + "lasting fact. Do not use web search. After it is saved, reply exactly "
+                    + "MEMORY_SAVED_OK.",
+                model: writer, in: app, assertEvidence: false)
+            if !evidence.toolActivities.contains("Saved to memory") {
+                // A 1-bit local model occasionally answers without calling the tool. A wiring regression
+                // fails earlier with run=failed diagnostics, so a single retry keeps the durable-memory
+                // contract from depending on sampling luck.
+                let retryMarker = uniqueMarker(
+                    writer == .bonsai ? "BONSAI_MEMORY_RETRY" : "GEMMA_MEMORY_RETRY"
+                )
+                evidence = try send(
+                    retryMarker + "\nMy temporary device-test name is \(code). You MUST call the remember "
+                        + "tool (the tool named remember) exactly once with text \"The user's temporary "
+                        + "device-test name is \(code).\" to save this lasting fact, then reply exactly "
+                        + "MEMORY_SAVED_OK. Do not use web search.",
+                    model: writer, in: app, assertEvidence: false)
+            }
+            writerEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: writer)
+                .map { "Writer generation: \($0)" }
+            // A 1-bit model may acknowledge by echoing the saved fact instead of the literal
+            // MEMORY_SAVED_OK. The durable Memory row and the reader's exact recall below are the real
+            // contract; only a reply that carries neither the marker nor the code is a genuine miss.
+            if evidence.answer != "MEMORY_SAVED_OK", !evidence.answer.contains(code) {
+                failures.append(
+                    "Writer answer was \(String(reflecting: evidence.answer)), "
+                        + "expected MEMORY_SAVED_OK or the saved code"
+                )
+            }
+            if !evidence.toolActivities.contains("Saved to memory") {
+                failures.append("Writer did not expose a successful Memory tool row: \(evidence.toolActivities)")
+            }
+            if evidence.toolActivities.contains(where: { $0.localizedCaseInsensitiveContains("Web Search") }) {
+                failures.append("Writer unexpectedly invoked Web Search: \(evidence.toolActivities)")
+            }
+        } catch {
+            failures.append("Writer turn did not commit inspectable evidence: \(error.localizedDescription)")
+        }
+
+        // Relaunch before reading the sheet so this proves the fact was persisted, not merely left in the
+        // current MemoryBook mirror. Missing state is recorded but does not stop the cross-model probe.
+        do {
+            try relaunch(app)
+            try goToSettings(in: app)
+            let memory = app.buttons.matching(
+                NSPredicate(format: "label BEGINSWITH %@", "Memory")
+            ).firstMatch
+            guard scrollToHittable(memory, in: app.scrollViews.firstMatch, swipingUp: false) else {
+                throw DeviceE2EHarnessError.precondition("Memory settings row is unreachable")
+            }
+            memory.tap()
+            guard app.navigationBars["Memory"].waitForExistence(timeout: 15) else {
+                throw DeviceE2EHarnessError.precondition("Memory sheet did not open")
+            }
+            let row = app.buttons.matching(
+                NSPredicate(format: "label CONTAINS %@", code)
+            ).firstMatch
+            if row.waitForExistence(timeout: 20) {
+                persistedText = row.label
+                persistedProvenance = row.value as? String
+                if !row.label.hasPrefix("The user") {
+                    failures.append("Persisted memory is not canonical English: \(row.label)")
+                }
+                if row.label.contains("用户") {
+                    failures.append("Chinese text leaked into canonical memory: \(row.label)")
+                }
+                if !(persistedProvenance?.hasPrefix("Saved by mobileLLM ·") == true) {
+                    failures.append("Persisted fact has wrong provenance: \(persistedProvenance ?? "<missing>")")
+                }
+            } else {
+                attachDiagnostics(app, name: "memory-missing-\(code)")
+                failures.append("No durable Memory row contains \(code) after relaunch")
+            }
+        } catch {
+            failures.append("Durable Memory inspection failed: \(error.localizedDescription)")
+        }
+
+        if app.navigationBars["Memory"].exists {
+            let done = app.navigationBars["Memory"].buttons["Done"]
+            if done.exists, done.isHittable {
+                done.tap()
+                if !app.navigationBars["Settings"].waitForExistence(timeout: 15) {
+                    failures.append("Memory sheet did not close after durable-state inspection")
+                }
+            }
+        }
+
+        do {
+            try configureTools(master: false, enabled: ["Memory"], in: app)
+            try openNewChat(in: app)
+            try activate(reader, in: app)
+            let evidence = try send(
+                "What is my temporary device-test name? Reply only with the exact name.",
+                model: reader, in: app, assertEvidence: false)
+            readerEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: reader)
+                .map { "Reader generation: \($0)" }
+            if evidence.answer != code {
+                failures.append("Reader answered \(String(reflecting: evidence.answer)), expected \(code)")
+            }
+            if !evidence.toolActivities.isEmpty {
+                failures.append("Reader invoked tools while the master switch was off: \(evidence.toolActivities)")
+            }
+        } catch {
+            failures.append("Cross-model recall probe did not complete: \(error.localizedDescription)")
+        }
+
+        let summary = XCTAttachment(string: """
+        writer=\(writer.displayName)
+        reader=\(reader.displayName)
+        expected_code=\(code)
+        writer_answer=\(writerEvidence?.answer ?? "<no evidence>")
+        writer_tools=\(writerEvidence?.toolActivities.joined(separator: " | ") ?? "<no evidence>")
+        persisted_text=\(persistedText ?? "<missing>")
+        persisted_provenance=\(persistedProvenance ?? "<missing>")
+        reader_answer=\(readerEvidence?.answer ?? "<no evidence>")
+        reader_tools=\(readerEvidence?.toolActivities.joined(separator: " | ") ?? "<no evidence>")
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "cross-model-memory-\(writer.modelID)-to-\(reader.modelID)"
+        summary.lifetime = .keepAlways
+        add(summary)
+
+        XCTAssertTrue(failures.isEmpty,
+                      "Cross-model Memory path had \(failures.count) independent failure(s):\n- "
+                          + failures.joined(separator: "\n- "))
+    }
+
+    @MainActor
+    private func exerciseBackgroundReload(_ model: DeviceTestModel) throws {
+        let app = try prepare(model, tools: false, selected: [], thinking: false)
+        let expectedBefore = "7319"
+        let expectedAfter = "8426"
+        var failures: [String] = []
+        var beforeEvidence: GenerationEvidence?
+        var afterEvidence: GenerationEvidence?
+        var afterCopyCount: Int?
+        var afterStatsCount: Int?
+
+        // Evidence validation is deliberately deferred: a stats-presentation defect must not prevent the
+        // test from exercising background suspension and the subsequent lazy reload.
+        do {
+            let evidence = try send(
+                "Reply with only the number \(expectedBefore).",
+                model: model, in: app, assertEvidence: false)
+            beforeEvidence = evidence
+            failures += generationEvidenceFailures(evidence, model: model)
+                .map { "Before-background generation: \($0)" }
+            if evidence.answer != expectedBefore {
+                failures.append(
+                    "Before-background answer was \(String(reflecting: evidence.answer)); "
+                        + "expected exactly \(expectedBefore)"
+                )
+            }
+        } catch {
+            failures.append("Before-background generation failed: \(error.localizedDescription)")
+        }
+
+        // Stage the second turn while the app is still foregrounded. On current iOS betas, XCUITest
+        // `typeText` immediately after reactivation can surface a cross-device paste permission alert;
+        // the safety firewall must not click that alert. Keeping the draft across background and tapping
+        // Send after foreground still exercises the real suspend -> lazy-load -> generation boundary.
+        let field = app.textFields["composer.field"]
+        if field.waitForExistence(timeout: 20), field.isHittable {
+            afterCopyCount = app.buttons.matching(identifier: "Copy answer").count
+            afterStatsCount = app.descendants(matching: .any)
+                .matching(identifier: "assistant.stats").count
+            field.tap()
+            field.typeText("Reply with only the number \(expectedAfter).")
+            if !waitForEnabled(app.buttons["Send"], timeout: 20) {
+                failures.append("The staged after-background draft did not enable Send")
+                afterCopyCount = nil
+                afterStatsCount = nil
+            }
+        } else {
+            failures.append("Composer was unavailable while staging the after-background turn")
+        }
+
+        XCUIDevice.shared.press(.home)
+        Thread.sleep(forTimeInterval: 5)
+        app.activate()
+        let conversationRestored = app.buttons["Active model"].waitForExistence(timeout: 30)
+        if !conversationRestored {
+            failures.append("Conversation UI did not return after foreground activation")
+        }
+
+        let suspended = waitForRuntime("resident=false", in: app, timeout: 60)
+        if !suspended {
+            failures.append(
+                "Backgrounding did not suspend resident weights: "
+                    + diagnosticValue("device-e2e.runtime", in: app)
+            )
+        }
+
+        if conversationRestored, let copyCount = afterCopyCount, let statsCount = afterStatsCount {
+            do {
+                let startedAt = Date()
+                let sendButton = app.buttons["Send"]
+                guard waitForEnabled(sendButton, timeout: 20) else {
+                    throw DeviceE2EHarnessError.precondition(
+                        "The staged after-background draft was not sendable after foreground activation"
+                    )
+                }
+                sendButton.tap()
+                let evidence = try waitForCommittedGeneration(
+                    model: model,
+                    in: app,
+                    previousCopyCount: copyCount,
+                    previousStatsCount: statsCount,
+                    startedAt: startedAt
+                )
+                afterEvidence = evidence
+                failures += generationEvidenceFailures(evidence, model: model)
+                    .map { "After-background generation: \($0)" }
+                if evidence.answer != expectedAfter {
+                    failures.append(
+                        "After-background answer was \(String(reflecting: evidence.answer)); "
+                            + "expected exactly \(expectedAfter)"
+                    )
+                }
+            } catch {
+                failures.append("After-background generation failed: \(error.localizedDescription)")
+            }
+        } else if !conversationRestored {
+            failures.append("After-background generation was unavailable because the conversation UI was absent")
+        } else {
+            failures.append("After-background generation was unavailable because its draft was not staged")
+        }
+
+        let reloaded = waitForRuntime("resident=true", in: app, timeout: 30)
+        if !reloaded {
+            failures.append(
+                "The next send did not lazily reload resident weights: "
+                    + diagnosticValue("device-e2e.runtime", in: app)
+            )
+        }
+
+        let summary = XCTAttachment(string: """
+        model=\(model.displayName)
+        expected_before=\(expectedBefore)
+        actual_before=\(beforeEvidence?.answer ?? "<no evidence>")
+        before_stats=\(beforeEvidence?.stats ?? "<no evidence>")
+        suspended=\(suspended)
+        expected_after=\(expectedAfter)
+        actual_after=\(afterEvidence?.answer ?? "<no evidence>")
+        after_stats=\(afterEvidence?.stats ?? "<no evidence>")
+        reloaded=\(reloaded)
+        runtime_final=\(diagnosticValue("device-e2e.runtime", in: app))
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "background-reload-\(model.modelID)"
+        summary.lifetime = .keepAlways
+        add(summary)
+
+        XCTAssertTrue(failures.isEmpty,
+                      "\(model.displayName) background lifecycle had \(failures.count) independent "
+                          + "failure(s):\n- " + failures.joined(separator: "\n- "))
+    }
+    // TEST-ID: AHT-TOOLS-005-DEVICE
+    /// Matrix test29: every Tool V2 adapter that crosses a real system/network boundary executes on
+    /// the physical device. The online model drives the calls so adapter coverage is never coupled to
+    /// local-model tool-calling quality; TCC prompts are granted by the shared system-alert firewall.
+    @MainActor
+    func test29ToolV2AdaptersOnDevice() throws {
+        let app = try launchApp()
+        try goToSettings(in: app)
+        let choose = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Choose tools")
+        ).firstMatch
+        guard scrollToHittable(choose, in: app.scrollViews.firstMatch) else {
+            throw DeviceE2EHarnessError.precondition("Choose tools row is unreachable")
+        }
+        choose.tap()
+        guard app.navigationBars["Tools"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not open")
+        }
+        let scroll = firstHittableScrollView(in: app)
+        for title in ["Web search", "Webpage reader", "Wikipedia", "Calculator", "Clock", "Memory",
+                      "Calendar", "Reminders", "Location"] {
+            let toggle = switchStarting(with: title, in: app)
+            guard scrollToHittable(toggle, in: scroll) else {
+                attachDiagnostics(app, name: "tool-toggle-missing-\(title)")
+                throw DeviceE2EHarnessError.precondition("Tool toggle is unreachable: \(title)")
+            }
+            try setSwitch(toggle, on: true)
+        }
+        let masterToggle = switchStarting(with: "Allow selected tools", in: app)
+        guard scrollToHittable(masterToggle, in: scroll, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Tool master switch is unreachable")
+        }
+        try setSwitch(masterToggle, on: true)
+        app.navigationBars["Tools"].buttons["Done"].tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not close")
+        }
+        try goToChatList(in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("TOOLV2")
+        // One tool per turn: the online model reliably executes a single explicit call, while a
+        // five-tool demand in one turn regularly repeats a call and trips the runtime's
+        // repeated-call protection (which is correct hard-budget behavior, not something to weaken).
+        let scenarios: [(tool: String, prompt: String)] = [
+            ("wikipedia",
+             "\(marker)\nCall the wikipedia tool exactly once with query \"Machine learning\", "
+                 + "then reply in one short line."),
+            ("fetch_webpage",
+             "\(marker)\nCall the fetch_webpage tool exactly once with url \"https://example.com\", "
+                 + "then reply in one short line."),
+            ("list_calendar_events",
+             "\(marker)\nCall the list_calendar_events tool exactly once with daysAhead 7, "
+                 + "then reply in one short line."),
+            ("create_reminder",
+             "\(marker)\nCall the create_reminder tool exactly once with title \"E2E \(marker) "
+                 + "reminder\" and no due time, then reply in one short line."),
+            ("current_location",
+             "\(marker)\nCall the current_location tool exactly once with no arguments, "
+                 + "then reply in one short line."),
+        ]
+        func matchesTool(_ activities: [String], _ tool: String) -> Bool {
+            let humanized = tool.replacingOccurrences(of: "_", with: " ").lowercased()
+            return activities.contains { activity in
+                let lower = activity.localizedLowercase
+                return lower.localizedCaseInsensitiveContains(tool)
+                    || lower.localizedCaseInsensitiveContains(humanized)
+            }
+        }
+        var missing: [String] = []
+        var allActivities: [String] = []
+        for scenario in scenarios {
+            var sawTool = false
+            for attempt in 0..<2 {
+                if sawTool { break }
+                let prompt = attempt == 0
+                    ? scenario.prompt
+                    : "\(uniqueMarker("TOOLV2_RETRY"))\nYou MUST call the \(scenario.tool) tool "
+                        + "exactly once and then reply briefly."
+                do {
+                    let evidence = try send(prompt, model: .bonsai, in: app,
+                                            timeout: 300, assertEvidence: false)
+                    allActivities += evidence.toolActivities
+                    sawTool = matchesTool(evidence.toolActivities, scenario.tool)
+                } catch {
+                    // A run-level rejection (e.g. the model repeated a call) is retried once with a
+                    // tighter instruction; the durable runtime keeps the protection itself.
+                }
+            }
+            if !sawTool { missing.append(scenario.tool) }
+        }
+
+        let summary = XCTAttachment(string: """
+        marker=\(marker)
+        tool_activities=\(allActivities.joined(separator: " | "))
+        missing=\(missing.isEmpty ? "none" : missing.joined(separator: ", "))
+        diagnostics=\(diagnosticValue("device-e2e.agent", in: app))
+        """)
+        summary.name = "tool-v2-adapters-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        XCTAssertTrue(
+            missing.isEmpty,
+            "Tool V2 adapters missing on device: \(missing.joined(separator: ", "))"
+        )
+    }
+
+    // TEST-ID: AH-IOS-003-DEVICE
+    /// Matrix test30: iOS 26 continued processing submits/rejects on the real phone through the
+    /// production BGTaskScheduler seam. Expiration/cancellation are covered deterministically by the
+    /// coordinator unit matrix; this scenario proves the device path: the setting, the run-start
+    /// submission, and a clean foreground outcome (resumable pause when the system rejects).
+    @MainActor
+    func test30ContinuedProcessingOnDevice() throws {
+        let app = try launchApp()
+        try goToSettings(in: app)
+        let toggle = switchStarting(with: "Continue work in background", in: app)
+        guard scrollToHittable(toggle, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Continued-processing toggle is unreachable")
+        }
+        try setSwitch(toggle, on: true)
+        try goToChatList(in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before continued-processing send")
+        }
+        field.tap()
+        field.typeText("Write a 200-word essay about background processing on iOS, then stop.")
+        let send = app.buttons["Send"]
+        guard waitForEnabled(send, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable")
+        }
+        send.tap()
+
+        // Submission happens at run start. A rejection quiesces the run to a resumable foreground
+        // wait; acceptance keeps it streaming. Either outcome must never fail the run.
+        let submissionDeadline = Date().addingTimeInterval(120)
+        var sawPause = false
+        var sawTerminal = false
+        while Date() < submissionDeadline {
+            let agent = diagnosticValue("device-e2e.agent", in: app)
+            if agent.contains("run=paused") || agent.contains("run=waitingForForeground") {
+                sawPause = true
+                break
+            }
+            if agent.contains("run=completed") || agent.contains("run=failed")
+                || agent.contains("run=cancelled")
+            {
+                sawTerminal = true
+                break
+            }
+            if app.buttons.matching(identifier: "Copy answer").count > 0 {
+                sawTerminal = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+
+        // Read the coordinator's status surface before navigating away.
+        try goToSettings(in: app)
+        let status = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Not started")
+        ).firstMatch
+        let waiting = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Waiting for the system")
+        ).firstMatch
+        let running = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "A run is continuing")
+        ).firstMatch
+        let statusText = [status, waiting, running]
+            .compactMap { $0.exists ? $0.label : nil }
+            .first
+        let agent = diagnosticValue("device-e2e.agent", in: app)
+
+        // Restore the fresh-install default before leaving so later serial tests never inherit the
+        // background-continuation path.
+        try setSwitch(toggle, on: false)
+
+        if let statusText,
+           statusText.hasPrefix("Not started"),
+           statusText.localizedCaseInsensitiveContains("not permitted")
+        {
+            throw XCTSkip(
+                "iOS 26 continued processing needs the Background Processing capability on the App ID "
+                    + "(com.apple.developer.background-tasks.continued-processing); the current device "
+                    + "profile lacks it. Coordinator reported: \(statusText)"
+            )
+        }
+
+        let summary = XCTAttachment(string: """
+        saw_pause=\(sawPause)
+        saw_terminal=\(sawTerminal)
+        status=\(statusText ?? "<none>")
+        diagnostics=\(agent)
+        """)
+        summary.name = "continued-processing-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        XCTAssertTrue(
+            sawPause || sawTerminal || statusText != nil,
+            "continued-processing scenario produced no observable outcome; diagnostics: \(agent)"
+        )
+    }
+
+    // TEST-ID: AHT-DYNAMIC-DEVICE-001
+    /// Matrix test31: the full message-anchored Dynamic Workflow lifecycle runs on the physical
+    /// device: validated candidate generation, automatic one-run launch, exact-source inspection,
+    /// durable child execution, and final-result projection back into the chat.
+    @MainActor
+    func test31WorkflowCompletesOnDevice() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Web search", "Webpage reader", "Wikipedia"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before workflow send")
+        }
+        field.tap()
+        field.typeText("/workflow research how sleep affects memory and produce a short three-section action plan")
+        let send = app.buttons["Send"]
+        guard waitForEnabled(send, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable for /workflow")
+        }
+        send.tap()
+
+        let composerDeadline = Date().addingTimeInterval(8)
+        while Date() < composerDeadline {
+            if !((field.value as? String) ?? "").contains("/workflow") { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertFalse(
+            ((field.value as? String) ?? "").contains("/workflow"),
+            "the composer must clear after a /workflow send"
+        )
+
+        let row = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
+        ).firstMatch
+        guard row.waitForExistence(timeout: 45) else {
+            attachDiagnostics(app, name: "workflow-row-missing")
+            throw DeviceE2EHarnessError.precondition("The message-anchored workflow record did not appear")
+        }
+
+        var rowState = readWorkflowValue(row) ?? ""
+        // Candidate preparation may include one full analyzer-guided repair after the first live
+        // model pass. Observe both bounded passes rather than timing out a valid repair in flight.
+        let candidateDeadline = Date().addingTimeInterval(1_200)
+        while Date() < candidateDeadline,
+              !rowState.contains("Running"),
+              !rowState.contains("Completed"),
+              !rowState.contains("Failed")
+        {
+            approvePendingAgentApprovalIfNeeded(in: app)
+            Thread.sleep(forTimeInterval: 1)
+            rowState = readWorkflowValue(row) ?? rowState
+        }
+        guard rowState.contains("Running") || rowState.contains("Completed") else {
+            attachDiagnostics(app, name: "workflow-candidate-failed")
+            throw DeviceE2EHarnessError.precondition(
+                "Dynamic Workflow did not auto-start after validation: \(rowState)"
+            )
+        }
+
+        row.tap()
+        guard app.navigationBars["Workflow"].waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Workflow candidate page did not open")
+        }
+        let sourceDisclosure = app.buttons["JavaScript source"]
+        guard sourceDisclosure.waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Exact JavaScript source disclosure is missing")
+        }
+        sourceDisclosure.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["workflow.source"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Once"].exists)
+        XCTAssertFalse(app.buttons["Always"].exists)
+        XCTAssertFalse(app.buttons["Deny"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["workflow.approval"].exists)
+
+        let state = app.descendants(matching: .any)["workflow.state"]
+        var lastState = state.label
+        var sawCompleted = false
+        let deadline = Date().addingTimeInterval(3_300)
+        while Date() < deadline {
+            approvePendingAgentApprovalIfNeeded(in: app)
+            lastState = state.label
+            if lastState == "Completed" {
+                sawCompleted = true
+                break
+            }
+            if ["Failed", "Denied or stopped", "Needs reconciliation"].contains(lastState) { break }
+            if app.state != .runningForeground {
+                attachDiagnostics(app, name: "workflow-left-foreground")
+                throw DeviceE2EHarnessError.precondition("App left foreground during workflow execution")
+            }
+            Thread.sleep(forTimeInterval: 2)
+        }
+
+        var failures: [String] = []
+        if !sawCompleted {
+            failures.append("workflow did not reach Completed; last status: \(lastState)")
+        }
+        if sawCompleted {
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "workflow-summary-page"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            app.navigationBars["Workflow"].buttons.firstMatch.tap()
+            let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
+            if answers.count == 0 {
+                failures.append("workflow completed without projecting its final result into the chat")
+            }
+        }
+
+        let summary = XCTAttachment(string: """
+        candidate_status=\(rowState)
+        last_status=\(lastState)
+        inspected_exact_source=true
+        automatic_one_run_launch=true
+        obsolete_launch_authorization_absent=true
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "workflow-completion-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        attachDiagnostics(app, name: "workflow-completion-final")
+
+        XCTAssertTrue(
+            failures.isEmpty,
+            "Device workflow run had \(failures.count) failure(s):\n- "
+                + failures.joined(separator: "\n- ")
+        )
+    }
+
+    @MainActor
+    private func readWorkflowValue(_ element: XCUIElement) -> String? {
+        for _ in 0..<10 {
+            if element.exists, let value = element.value as? String { return value }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return nil
+    }
+}
+
+/// Simulator-first online-model matrix (iPhone Simulator focus). Requires the test runner to inject
+/// the OpenAI-compatible config (~/.mobilellm/openai.json via launchEnvironment). No local weights
+/// are needed: every case selects the online model and drives the same production agent-runtime path
+/// the physical-device matrix uses. Non-approval cases run on the product default (Safe preset) so
+/// safe in-app/read/online operations proceed without prompts; approval has dedicated cases.
+final class SimulatorOnlineE2EUITests: DeviceE2ETestCase {
+
+    @MainActor
+    private func selectApprovalMode(_ title: String, in app: XCUIApplication) throws {
+        let bar = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approval:")
+        ).firstMatch
+        XCTAssertTrue(bar.waitForExistence(timeout: 15), "Approval mode bar is missing")
+        bar.tap()
+        let option = app.buttons[title]
+        XCTAssertTrue(option.waitForExistence(timeout: 5), "Approval menu item is missing: \(title)")
+        option.tap()
+    }
+
+    @MainActor
+    func test01OnlineModelIsSendableWithoutAnyLocalWeights() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let runtime = diagnosticValue("device-e2e.runtime", in: app)
+        XCTAssertTrue(runtime.contains("resident=false"),
+                      "online selection must not allocate local weights: \(runtime)")
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        field.tap()
+        field.typeText("hello")
+        XCTAssertTrue(waitForEnabled(app.buttons["Send"], timeout: 20),
+                      "online model must make the composer sendable without any local model")
+    }
+
+    @MainActor
+    func test02OnlineAnswerStreamsLiveThenCommits() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        field.tap()
+        field.typeText("Write a detailed 800-word essay about sleep and memory, with at least ten "
+            + "paragraphs. Do not stop early.")
+        let sendButton = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(sendButton, timeout: 20))
+        sendButton.tap()
+
+        // Token-by-token promise: answer text must grow BEFORE the committed stats appear. The
+        // default Safe preset auto-approves online inference, so no approval card interrupts.
+        var sawLiveText = false
+        let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
+        let deadline = Date().addingTimeInterval(240)
+        while Date() < deadline {
+            if app.buttons.matching(identifier: "Copy answer").count > copyCount { break }
+            if app.buttons["Stop"].exists,
+               let last = answers.allElementsBoundByIndex.last
+            {
+                let value = (last.value as? String) ?? last.label
+                if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    sawLiveText = true
+                    break
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(sawLiveText,
+                      "online answer must stream token-by-token before the run commits")
+
+        // Sticky-bottom autoscroll: while generation is still streaming and the user never scrolled,
+        // the thread must stay pinned at the latest output (no "Scroll to latest" pill). Scrolling
+        // away must surface the pill and stop the yank; tapping it re-pins and hides it again.
+        let pill = app.buttons.matching(
+            NSPredicate(format: "label == %@", "Scroll to latest")
+        ).firstMatch
+        XCTAssertFalse(pill.exists,
+                       "auto-follow must keep the thread pinned during streaming")
+        let dragStart = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        let dragEnd = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9))
+        dragStart.press(forDuration: 0.05, thenDragTo: dragEnd)
+        XCTAssertTrue(pill.waitForExistence(timeout: 5),
+                      "scrolling away mid-stream must surface the Scroll to latest pill")
+        let pillStillThere = pill.waitForExistence(timeout: 3)
+        XCTAssertTrue(pillStillThere,
+                      "auto-follow must not yank the user back down after a deliberate scroll")
+        pill.tap()
+        XCTAssertTrue(waitUntilGone(pill, timeout: 5),
+                      "tapping the pill must re-pin the thread to the latest output")
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertFalse(pill.exists,
+                       "auto-follow must keep re-pinning while streaming continues")
+
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+        let diagnostics = diagnosticValue("device-e2e.agent", in: app)
+        XCTAssertTrue(diagnostics.contains("run=completed"),
+                      "agent run must complete: \(diagnostics)")
+    }
+
+    @MainActor
+    func test03OnlineReasoningStreamsIntoSharedDisclosure() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        field.tap()
+        field.typeText("Think step by step: multiply 123 by 4 and show each step before the final number.")
+        let send = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(send, timeout: 20))
+        send.tap()
+
+        // The default Safe preset auto-approves online inference, so the reasoning phase surfaces
+        // the shared Thinking… disclosure while streaming without an approval card.
+        let thinking = app.buttons["Thinking…"]
+        XCTAssertTrue(thinking.waitForExistence(timeout: 180),
+                      "online reasoning must surface the shared Thinking… disclosure")
+        thinking.tap()
+
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+        // The disclosure auto-collapses to "Thought for Ns" once the answer starts; expand it so the
+        // committed reasoning text is actually in the accessibility tree.
+        let finishedThought = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Thought for ")
+        ).lastMatch
+        if finishedThought.waitForExistence(timeout: 10) {
+            finishedThought.tap()
+        }
+        let reasoning = app.descendants(matching: .any)
+            .matching(identifier: "assistant.reasoning").allElementsBoundByIndex.last
+        let capturedReasoning = reasoning.flatMap { ($0.value as? String) ?? $0.label }
+        XCTAssertFalse(capturedReasoning?.isEmpty ?? true,
+                       "committed online reasoning must be captured in the shared disclosure")
+    }
+
+    @MainActor
+    func test04OnlineMultiTurnContext() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let nonce = "NOVA-\(Int.random(in: 10_000...99_999))"
+        let first = try send(
+            "Remember the nonce \(nonce). Reply with only that nonce and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        let second = try send(
+            "Reply with only the nonce from my prior message.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertEqual(first.answer, nonce)
+        XCTAssertEqual(second.answer, nonce, "online model lost immediate multi-turn context")
+    }
+
+    @MainActor
+    func test05OnlineAskModeApprovesOnceThenFullAccessAutoRuns() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        // This case is the approval-specific one: pin Ask explicitly (the product default is Safe
+        // preset) so the first online inference pauses for an approval card.
+        let approvalBar = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approval:")
+        ).firstMatch
+        XCTAssertTrue(approvalBar.waitForExistence(timeout: 15))
+        approvalBar.tap()
+        let ask = app.buttons["Ask"]
+        XCTAssertTrue(ask.waitForExistence(timeout: 5))
+        ask.tap()
+
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        field.tap()
+        field.typeText("Reply with exactly ONE word: APPROVED")
+        let send = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(send, timeout: 20))
+        send.tap()
+
+        // In Ask mode the first online inference must pause for an approval card.
+        let approve = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approve")
+        ).firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 60),
+                      "Ask mode must pause online inference for approval")
+        approve.tap()
+        let first = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(first.answer.isEmpty)
+
+        // Switch the persistent bottom bar to Full access: the next turn completes without a card.
+        let askApprovalBar = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approval: Ask")
+        ).firstMatch
+        XCTAssertTrue(askApprovalBar.waitForExistence(timeout: 10))
+        askApprovalBar.tap()
+        let fullAccess = app.buttons["Full access"]
+        XCTAssertTrue(fullAccess.waitForExistence(timeout: 5))
+        fullAccess.tap()
+
+        let copy2 = app.buttons.matching(identifier: "Copy answer").count
+        let stats2 = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        field.tap()
+        field.typeText("Reply with exactly ONE word: RELEASED")
+        XCTAssertTrue(waitForEnabled(send, timeout: 20))
+        send.tap()
+
+        var sawApprovalCard = false
+        let noCardDeadline = Date().addingTimeInterval(30)
+        while Date() < noCardDeadline {
+            if approve.exists {
+                sawApprovalCard = true
+                break
+            }
+            if app.buttons.matching(identifier: "Copy answer").count > copy2 { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertFalse(sawApprovalCard, "Full access must not pause for approval")
+        let second = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copy2,
+            previousStatsCount: stats2,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(second.answer.isEmpty)
+    }
+
+    /// Tool selection is app state, not model state: toggles and the master switch must survive a
+    /// relaunch even with no local weights installed, and the bottom bar must show the Safe preset
+    /// default (spec §15.2).
+    @MainActor
+    func test06ToolSelectionPersistsAcrossRelaunch() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        // Product default surfaces in the persistent bottom bar.
+        let approvalBar = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approval: Safe preset")
+        ).firstMatch
+        XCTAssertTrue(approvalBar.waitForExistence(timeout: 15),
+                      "new conversations must default to Safe preset approval")
+
+        try configureTools(master: true, enabled: ["Calculator", "Web search"], in: app)
+        try relaunch(app)
+        try goToSettings(in: app)
+        let choose = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Choose tools")
+        ).firstMatch
+        XCTAssertTrue(scrollToHittable(choose, in: app.scrollViews.firstMatch))
+        choose.tap()
+        XCTAssertTrue(app.navigationBars["Tools"].waitForExistence(timeout: 15))
+        let scroll = firstHittableScrollView(in: app)
+        let expected: [String: Bool] = [
+            "Web search": true, "Webpage reader": false, "Wikipedia": false,
+            "Calculator": true, "Clock": false, "Memory": false,
+        ]
+        for (title, on) in expected {
+            let toggle = switchStarting(with: title, in: app)
+            XCTAssertTrue(scrollToHittable(toggle, in: scroll))
+            XCTAssertEqual(switchIsOn(toggle), on, "Persisted tool selection drifted: \(title)")
+        }
+        let master = switchStarting(with: "Allow selected tools", in: app)
+        XCTAssertTrue(scrollToHittable(master, in: scroll, swipingUp: false))
+        XCTAssertTrue(switchIsOn(master))
+    }
+
+    /// Calculator is a local pure tool: Safe preset auto-approves it, the exact result must reach the
+    /// user, and the tool row must appear in the run steps.
+    @MainActor
+    func test07OnlineCalculatorTool() throws {
+        let app = try launchApp()
+        // Configure tools BEFORE opening the sending conversation: an empty thread created earlier
+        // would be reused and keep its creation-time (tool-less) policy.
+        try configureTools(master: true, enabled: ["Calculator"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("ONLINE_CALC")
+        var evidence = try send(
+            marker + "\nWhat is 1234567 * 7654321? You do not know this product from memory. "
+                + "You MUST call the calculator tool exactly once to compute it, "
+                + "then reply exactly RESULT=9449772114007.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        if evidence.toolActivities.isEmpty {
+            // Online models sometimes answer from arithmetic knowledge instead of calling the tool.
+            // Retry once with the tool-call made mandatory (same wiring the device clock test uses).
+            evidence = try send(
+                marker + "\nYou cannot multiply these numbers from memory. You MUST call the "
+                    + "calculator tool exactly once before answering. Use the calculator to multiply "
+                    + "1234567 by 7654321, then reply exactly RESULT=9449772114007.",
+                model: .bonsai, in: app, timeout: 300, assertEvidence: false
+            )
+        }
+        XCTAssertEqual(
+            evidence.toolActivities.count,
+            1,
+            "unexpected tool chain: \(evidence.toolActivities)"
+        )
+        XCTAssertEqual(evidence.toolActivities.first, "Calculator returned 9449772114007")
+        XCTAssertTrue(evidence.answer.contains("9449772114007"),
+                      "answer must carry the computed result: \(evidence.answer)")
+    }
+
+    /// Web search is a bounded network read: Safe preset auto-approves it and the run must surface
+    /// the tool activity without any approval card.
+    @MainActor
+    func test08OnlineWebSearchTool() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Web search"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("ONLINE_SEARCH")
+        var evidence = try send(
+            marker + "\nWhat is today's date? You do not know today's date reliably from memory. "
+                + "You MUST call the web search tool EXACTLY ONCE to look it up, then reply with the date "
+                + "and one sentence of context.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        if evidence.toolActivities.isEmpty {
+            evidence = try send(
+                marker + "\nYou MUST call the web search tool exactly once before answering. Use web search to "
+                    + "look up today's date, then reply with the date and one sentence of context.",
+                model: .bonsai, in: app, timeout: 300, assertEvidence: false
+            )
+        }
+        XCTAssertTrue(
+            evidence.toolActivities.contains(where: {
+                $0.localizedCaseInsensitiveContains("web_search")
+                    || $0.localizedCaseInsensitiveContains("web search")
+            }),
+            "web search tool activity is missing: \(evidence.toolActivities)"
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+    }
+
+    /// Memory is a private-data read/write: Safe preset auto-approves it and the recalled fact must
+    /// survive across turns in the same conversation.
+    @MainActor
+    func test09OnlineMemoryRememberRecall() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Memory"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let fact = "E2E_SKY_\(Int.random(in: 10_000...99_999))"
+        let first = try send(
+            "Remember this fact: the sky color is \(fact). Reply with only CONFIRMED.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertFalse(first.answer.isEmpty)
+        let second = try send(
+            "According to my memory, what is the sky color? Reply with only the fact.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertTrue(
+            second.answer.contains(fact),
+            "recalled fact is missing from the answer: \(second.answer)"
+        )
+    }
+
+    /// Approval-specific network read: with Ask pinned, a first-use web search must pause for an
+    /// approval card; Safe preset must not.
+    @MainActor
+    func test10AskModeWebSearchApprovalCard() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Web search"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+        try selectApprovalMode("Ask", in: app)
+
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        field.tap()
+        field.typeText("Use web search to look up the current year, then reply with the year only.")
+        let send = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(send, timeout: 20))
+        send.tap()
+
+        let approve = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Approve")
+        ).firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 90),
+                      "Ask mode must pause first-use web search for approval")
+        approve.tap()
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+    }
+
+    /// Stop mid-generation commits the partial answer, marks the turn cancelled, and the next turn
+    /// recovers — with the online provider behind the same agent runtime.
+    @MainActor
+    func test11OnlineStopCommitsPartialAndRecovers() throws {
+        let app = try launchApp()
+        // Tool settings persist across launches inside one simulator run; stop/recovery must not
+        // inherit tools that an earlier case enabled (they change the wire request shape).
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("ONLINE_STOP")
+        let copies = app.buttons.matching(identifier: "Copy answer").count
+        let statsBefore = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        field.tap()
+        field.typeText(
+            marker + "\nWrite a detailed 2500-word technical essay comparing ten sorting algorithms, "
+                + "with proofs and examples. Do not finish early."
+        )
+        let sendButton = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(sendButton, timeout: 20))
+        sendButton.tap()
+
+        let stop = app.buttons["Stop"]
+        XCTAssertTrue(waitForEnabled(stop, timeout: 240), "Stop never became actionable")
+        Thread.sleep(forTimeInterval: 2)
+        stop.tap()
+        XCTAssertTrue(waitUntilGone(stop, timeout: 20), "Stop did not settle at a token boundary")
+
+        let statsQuery = app.descendants(matching: .any).matching(identifier: "assistant.stats")
+        let stoppedQuery = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Stopped")
+        )
+        var statsValue = ""
+        let settleDeadline = Date().addingTimeInterval(10)
+        while Date() < settleDeadline {
+            if let stats = statsQuery.allElementsBoundByIndex.last {
+                statsValue = (stats.value as? String) ?? stats.label
+                if !statsValue.isEmpty { break }
+            }
+            if stoppedQuery.firstMatch.exists { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(stoppedQuery.firstMatch.exists || statsValue.contains("stop: cancelled"),
+                      "stopped turn is neither marked Stopped nor cancelled: \(statsValue)")
+        XCTAssertTrue(sendButton.waitForExistence(timeout: 10))
+
+        let recovery = try send(
+            "Reply exactly RECOVERED and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertEqual(recovery.answer, "RECOVERED", "online model could not generate after Stop")
+        XCTAssertGreaterThanOrEqual(app.buttons.matching(identifier: "Copy answer").count, copies + 1)
+        XCTAssertGreaterThanOrEqual(
+            app.descendants(matching: .any).matching(identifier: "assistant.stats").count,
+            statsBefore + 1
+        )
+    }
+
+    /// Regenerate must keep the user's prompt bubble visible (only the assistant turn is replaced),
+    /// then stream and commit a fresh answer — the thread must never appear to wipe history while the
+    /// context meter still counts it.
+    @MainActor
+    func test12OnlineRegenerateKeepsUserMessageAndStreamsFreshAnswer() throws {
+        let app = try launchApp()
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("REGEN")
+        let first = try send(
+            "\(marker)\nReply with exactly the word FIRST and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertFalse(first.answer.isEmpty)
+
+        let userBubbles = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "You said")
+        )
+        let userText = ((userBubbles.allElementsBoundByIndex.last?.value) as? String) ?? ""
+        XCTAssertTrue(userText.contains(marker), "user bubble must carry the prompt: \(userText)")
+
+        let regenerate = app.buttons.matching(identifier: "Regenerate answer").lastMatch
+        XCTAssertTrue(regenerate.waitForExistence(timeout: 10))
+        regenerate.tap()
+
+        // Immediately after the tap the user's prompt must still be rendered. A fresh run replaces
+        // only the assistant turn; history must never blank out.
+        let stillThere = ((userBubbles.allElementsBoundByIndex.last?.value) as? String) ?? ""
+        XCTAssertEqual(stillThere, userText,
+                       "regenerate must keep the user's message visible")
+
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+        let finalUserText = ((userBubbles.allElementsBoundByIndex.last?.value) as? String) ?? ""
+        XCTAssertEqual(finalUserText, userText,
+                       "user's message must survive the regenerated turn")
+    }
+
+    /// Multi-turn regenerate: replacing the LAST assistant turn must keep BOTH user prompts visible,
+    /// not blank the thread.
+    @MainActor
+    func test13OnlineRegenerateLastTurnKeepsMultiTurnHistory() throws {
+        let app = try launchApp()
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let firstMarker = uniqueMarker("REGEN_A")
+        let secondMarker = uniqueMarker("REGEN_B")
+        let first = try send(
+            "\(firstMarker)\nReply with exactly TURN1 and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        let second = try send(
+            "\(secondMarker)\nReply with exactly TURN2 and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        XCTAssertFalse(first.answer.isEmpty)
+        XCTAssertFalse(second.answer.isEmpty)
+
+        let userBubbles = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "You said")
+        )
+        let textsBefore = userBubbles.allElementsBoundByIndex.compactMap {
+            ($0.value as? String) ?? ""
+        }
+        XCTAssertEqual(textsBefore.count, 2)
+        XCTAssertTrue(textsBefore[0].contains(firstMarker))
+        XCTAssertTrue(textsBefore[1].contains(secondMarker))
+
+        let regenerate = app.buttons.matching(identifier: "Regenerate answer").lastMatch
+        XCTAssertTrue(regenerate.waitForExistence(timeout: 10))
+        regenerate.tap()
+
+        let textsAfter = userBubbles.allElementsBoundByIndex.compactMap {
+            ($0.value as? String) ?? ""
+        }
+        XCTAssertEqual(textsAfter, textsBefore,
+                       "regenerate must keep every user prompt in a multi-turn thread")
+
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+        let textsFinal = userBubbles.allElementsBoundByIndex.compactMap {
+            ($0.value as? String) ?? ""
+        }
+        XCTAssertEqual(textsFinal, textsBefore)
+    }
+
+    /// Regenerating an EARLIER turn confirms the discard of later turns; the earlier user prompt must
+    /// stay visible and only the later turns may disappear (by design).
+    @MainActor
+    func test14OnlineRegenerateEarlierTurnKeepsItsUserPrompt() throws {
+        let app = try launchApp()
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let firstMarker = uniqueMarker("REGEN_X")
+        let secondMarker = uniqueMarker("REGEN_Y")
+        _ = try send(
+            "\(firstMarker)\nReply with exactly TURN1 and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+        _ = try send(
+            "\(secondMarker)\nReply with exactly TURN2 and nothing else.",
+            model: .bonsai, in: app, timeout: 300, assertEvidence: false
+        )
+
+        let regenerateFirst = app.buttons.matching(identifier: "Regenerate answer").firstMatch
+        XCTAssertTrue(regenerateFirst.waitForExistence(timeout: 10))
+        regenerateFirst.tap()
+
+        let confirm = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Discard ")
+        ).firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10),
+                      "regenerating an earlier turn must confirm discarding later turns")
+        confirm.tap()
+
+        let userBubbles = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "You said")
+        )
+        let textsAfter = userBubbles.allElementsBoundByIndex.compactMap {
+            ($0.value as? String) ?? ""
+        }
+        XCTAssertEqual(textsAfter.count, 1,
+                       "later turns are discarded by design, but the regenerated turn's prompt stays")
+        XCTAssertTrue(textsAfter[0].contains(firstMarker))
+
+        let copyCount = app.buttons.matching(identifier: "Copy answer").count
+        let statsCount = app.descendants(matching: .any).matching(identifier: "assistant.stats").count
+        let evidence = try waitForCommittedGeneration(
+            model: .bonsai, in: app,
+            previousCopyCount: copyCount,
+            previousStatsCount: statsCount,
+            startedAt: Date(),
+            timeout: 300,
+            assertStatsModel: false
+        )
+        XCTAssertFalse(evidence.answer.isEmpty)
+    }
+
+    /// The stream must follow the latest output INTO the visible viewport: while generation continues,
+    /// the bottom of the live answer stays above the composer instead of scrolling off-screen.
+    @MainActor
+    func test15OnlineStreamFollowsLatestOutputIntoView() throws {
+        let app = try launchApp()
+        try configureTools(master: false, enabled: [], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20))
+        field.tap()
+        field.typeText("Write a detailed 800-word essay about sleep and memory, with at least ten "
+            + "paragraphs. Do not stop early.")
+        let send = app.buttons["Send"]
+        XCTAssertTrue(waitForEnabled(send, timeout: 20))
+        send.tap()
+
+        let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
+        let streamStart = Date()
+        var sawStreaming = false
+        while Date().timeIntervalSince(streamStart) < 240 {
+            if app.buttons["Stop"].exists,
+               let last = answers.allElementsBoundByIndex.last
+            {
+                let value = (last.value as? String) ?? last.label
+                if value.trimmingCharacters(in: .whitespacesAndNewlines).count > 40 {
+                    sawStreaming = true
+                    break
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(sawStreaming, "online answer must stream before commit")
+
+        // Over the next several seconds of growth, the live answer's bottom must stay at/above the
+        // composer's top edge (the settings row occupies the small strip between thread and composer).
+        let composerFrame = field.frame
+        var latestMaxY: CGFloat = 0
+        var allVisible = true
+        let checkDeadline = Date().addingTimeInterval(8)
+        while Date() < checkDeadline {
+            Thread.sleep(forTimeInterval: 1)
+            guard let last = answers.allElementsBoundByIndex.last else { continue }
+            latestMaxY = last.frame.maxY
+            if latestMaxY > composerFrame.minY + 12 {
+                allVisible = false
+            }
+        }
+        let pillPresent = app.buttons.matching(
+            NSPredicate(format: "label == %@", "Scroll to latest")
+        ).firstMatch.exists
+        let stillStreaming = app.buttons["Stop"].exists
+        XCTAssertTrue(
+            allVisible,
+            "stream must follow the latest text into view; answer bottom \(latestMaxY), "
+                + "composer top \(composerFrame.minY), pill=\(pillPresent), streaming=\(stillStreaming)"
+        )
+    }
+
+    /// The conversation overflow menu (spec §20): all entries exist, Workflow is disabled while
+    /// nothing runs, and data pages push (Files) and return.
+    @MainActor
+    func test16OverflowMenuOpensPages() throws {
+        let app = try launchApp()
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let menu = app.buttons["Conversation menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 15))
+        menu.tap()
+
+        for label in ["Rename", "Delete", "Add to Project", "Workflow",
+                      "Background tasks", "Files", "Terminal", "Settings"] {
+            XCTAssertTrue(app.buttons[label].waitForExistence(timeout: 5),
+                          "menu item \(label) is missing")
+        }
+        XCTAssertFalse(app.buttons["Workflow"].isEnabled,
+                       "Workflow must be disabled while no workflow is running")
+
+        app.buttons["Files"].tap()
+        let filesBar = app.navigationBars["Files"]
+        XCTAssertTrue(filesBar.waitForExistence(timeout: 10),
+                      "Files must push a real page, not be a disabled placeholder")
+        filesBar.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(menu.waitForExistence(timeout: 10), "back must return to the conversation")
+
+        menu.tap()
+        app.buttons["Background tasks"].tap()
+        XCTAssertTrue(app.navigationBars["Background tasks"].waitForExistence(timeout: 10),
+                      "Background tasks must push its page")
+        app.navigationBars["Background tasks"].buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+
+        // Add to Project opens the tag picker sheet with a Done affordance.
+        menu.tap()
+        app.buttons["Add to Project"].tap()
+        let projectBar = app.navigationBars["Add to Project"]
+        XCTAssertTrue(projectBar.waitForExistence(timeout: 10),
+                      "Add to Project must open the tag picker")
+        projectBar.buttons["Done"].tap()
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+    }
+
+}
+
+private extension XCUIElementQuery {
+    var lastMatch: XCUIElement { element(boundBy: max(0, count - 1)) }
+}

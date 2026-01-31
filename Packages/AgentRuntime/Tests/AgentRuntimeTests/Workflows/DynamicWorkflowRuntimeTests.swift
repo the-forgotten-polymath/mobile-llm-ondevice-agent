@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: MIT
+
+import AgentContracts
+@testable import AgentRuntime
+import XCTest
+
+// TEST-ID: AHT-DYNAMIC-001
+
+final class DynamicWorkflowRuntimeTests: XCTestCase {
+    func testAnalyzerExtractsPureMetadataAndInstrumentsEveryBracedLoop() throws {
+        let analysis = try analyze("""
+        // Leading comments are allowed before the first statement.
+        export const meta = {
+          name: 'audit-routes',
+          description: 'Audit routes',
+          whenToUse: 'When routes change',
+          phases: [{ title: 'Discover', detail: 'Find files', model: 'small' }],
+        };
+        let count = 0;
+        for (const item of args.items) { log(item); }
+        while (count < 0) { log(count); }
+        do { log('once'); } while (false);
+        return { ok: true };
+        """)
+
+        XCTAssertEqual(analysis.metadata.name, "audit-routes")
+        XCTAssertEqual(analysis.metadata.phases.first?.title, "Discover")
+        XCTAssertEqual(analysis.checkpointSites, 4) // entry + for + while + do
+        XCTAssertFalse(analysis.executableSource.contains("export const meta"))
+        XCTAssertEqual(
+            analysis.instrumentedSource.components(separatedBy: "__workflowCheckpoint").count - 1,
+            4
+        )
+    }
+
+    func testAnalyzerRejectsDynamicMetadataForbiddenCapabilitiesAndUnsafeLoops() throws {
+        XCTAssertThrowsError(try analyze("return 1"))
+        XCTAssertThrowsError(try analyze("""
+        export const meta = { name: getName(), description: 'bad' };
+        return 1;
+        """))
+
+        for source in [
+            "return fetch('https://example.com')",
+            "return import('module')",
+            "return Function('return 1')()",
+            "return ({})['constructor']",
+            "return Math.random()",
+            "return this",
+            "return __mllmStartAgent(1, 'x', '{}')",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(source)), source)
+        }
+        XCTAssertThrowsError(try analyze(wrapped("while (true) log('x')")))
+
+        // Capability names in ordinary strings and comments are data, not executable identifiers.
+        XCTAssertNoThrow(try analyze(wrapped("// fetch eval\nreturn 'Function constructor fetch'")))
+    }
+
+    func testAnalyzerFailurePublishesItsSafeDiagnosticThroughLocalizedError() throws {
+        let error = WorkflowScriptAnalysisError.malformedMetadata(
+            "workflow name must be lowercase kebab-case"
+        )
+        XCTAssertEqual(
+            error.localizedDescription,
+            "Invalid workflow metadata: workflow name must be lowercase kebab-case"
+        )
+    }
+
+    func testTemplateAnalysisIgnoresRawProseAndChecksEveryInterpolation() throws {
+        XCTAssertNoThrow(try analyze(wrapped(
+            "return `Synthesize with ${args.model} and review with ${args.device.name}.`;"
+        )))
+
+        for body in [
+            "return `unsafe ${fetch('https://example.com')}`;",
+            "return `unsafe ${Object['pro' + 'totype']}`;",
+            "return `hidden dispatch ${agent('not-visible')}`;",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(body)), body)
+        }
+    }
+
+    func testJavaScriptCoreRunsSequentialAgentArgsPhaseLogAndBudget() async throws {
+        let recorder = WorkflowInvocationRecorder()
+        let analysis = try analyze("""
+        export const meta = { name: 'sequential', description: 'Sequential bridge' };
+        phase('Research');
+        log({ started: true });
+        const answer = await agent('hello ' + args.name + ' ' + serialize({ tags: ['a', 'b'] }), { label: 'primary' });
+        return { answer, total: budget.total, spent: budget.spent(), remaining: budget.remaining() };
+        """)
+        let arguments = try CanonicalJSON(.object(["name": .string("Dong")]))
+        let host = WorkflowScriptHost(
+            agent: { invocation in
+                let prompt = invocation.prompt
+                let options = invocation.options
+                await recorder.record(prompt: prompt, options: options)
+                return .value(.string(prompt + "!"))
+            },
+            phase: { value in Task { await recorder.record(phase: value) } },
+            log: { value in Task { await recorder.record(log: value) } },
+            budget: { WorkflowBudgetSnapshot(totalOutputTokens: 100, spentOutputTokens: 25) }
+        )
+
+        let result = try await JavaScriptCoreWorkflowRuntime().execute(
+            analysis,
+            args: arguments,
+            limits: try limits(),
+            requirement: .init(),
+            host: host
+        )
+        let value = try decode(result)
+        XCTAssertEqual(value, .object([
+            "answer": .string("hello Dong {\"tags\":[\"a\",\"b\"]}!"),
+            "total": .integer(100),
+            "spent": .integer(25),
+            "remaining": .integer(75),
+        ]))
+        let snapshot = await recorder.snapshot()
+        XCTAssertEqual(snapshot.prompts, ["hello Dong {\"tags\":[\"a\",\"b\"]}"])
+        XCTAssertEqual(snapshot.options.first?.label, "primary")
+        XCTAssertEqual(snapshot.options.first?.phase, "Research")
+        XCTAssertEqual(snapshot.phases, ["Research"])
+        XCTAssertEqual(snapshot.logs, ["{\"started\":true}"])
+    }
+
+    func testParallelIsConcurrentBarrierOrderedAndUnavailableBecomesNull() async throws {
+        let recorder = WorkflowInvocationRecorder(delays: ["slow": 120_000_000, "fast": 5_000_000])
+        let analysis = try analyze(wrapped("""
+        return await parallel([
+          () => agent('slow'),
+          () => agent('fast'),
+          () => agent('missing'),
+        ]);
+        """))
+        let host = WorkflowScriptHost(agent: { invocation in
+            let prompt = invocation.prompt
+            let options = invocation.options
+            return try await recorder.execute(prompt: prompt, options: options)
+        })
+
+        let result = try await JavaScriptCoreWorkflowRuntime().execute(
+            analysis,
+            args: nil,
+            limits: try limits(),
+            requirement: .init(),
+            host: host
+        )
+        XCTAssertEqual(try decode(result), .array([.string("slow"), .string("fast"), .null]))
+        let snapshot = await recorder.snapshot()
+        XCTAssertGreaterThanOrEqual(snapshot.maximumActive, 2)
+    }
+
+    func testPipelineLetsItemsAdvanceIndependentlyAndPreservesItemOrder() async throws {
+        let recorder = WorkflowInvocationRecorder(delays: ["discover-a": 140_000_000, "discover-b": 5_000_000])
+        let analysis = try analyze(wrapped("""
+        return await pipeline(
+          ['a', 'b'],
+          item => agent(`discover-${item}`),
+          (value, item) => agent(`verify-${item}`),
+        );
+        """))
+        let host = WorkflowScriptHost(agent: { invocation in
+            let prompt = invocation.prompt
+            let options = invocation.options
+            return try await recorder.execute(prompt: prompt, options: options)
+        })
+
+        let result = try await JavaScriptCoreWorkflowRuntime().execute(
+            analysis,
+            args: nil,
+            limits: try limits(),
+            requirement: .init(),
+            host: host
+        )
+        XCTAssertEqual(try decode(result), .array([.string("verify-a"), .string("verify-b")]))
+        let snapshot = await recorder.snapshot()
+        let verifyB = try XCTUnwrap(snapshot.starts.firstIndex(of: "verify-b"))
+        let verifyA = try XCTUnwrap(snapshot.starts.firstIndex(of: "verify-a"))
+        XCTAssertLessThan(verifyB, verifyA)
+    }
+
+    func testAgentOptionsValidateSchemaAndRejectUnknownFieldsBeforeHostDispatch() async throws {
+        let recorder = WorkflowInvocationRecorder()
+        let valid = try analyze(wrapped("""
+        return await agent('structured', {
+          schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } }, additionalProperties: false },
+          model: 'local-small', agentType: 'reviewer', isolation: 'sandbox', stallMs: 50,
+        });
+        """))
+        let host = WorkflowScriptHost(agent: { invocation in
+            let prompt = invocation.prompt
+            let options = invocation.options
+            await recorder.record(prompt: prompt, options: options)
+            return .value(.object(["ok": .bool(true)]))
+        })
+        _ = try await JavaScriptCoreWorkflowRuntime().execute(
+            valid, args: nil, limits: try limits(), requirement: .init(), host: host
+        )
+        let validSnapshot = await recorder.snapshot()
+        let options = try XCTUnwrap(validSnapshot.options.first)
+        XCTAssertEqual(options.requestedModel, "local-small")
+        XCTAssertEqual(options.requestedAgentType, "reviewer")
+        XCTAssertTrue(options.requiresIsolatedWorkspace)
+        XCTAssertEqual(options.stallMilliseconds, 50)
+        XCTAssertNotNil(options.schema)
+
+        for invalid in [
+            "return await agent('bad', { scema: {} });",
+            "return await agent('bad', { tools: ['web'] });",
+            "const options = { label: 'hidden' }; return await agent('bad', options);",
+            "return await agent('bad', { ['label']: 'hidden' });",
+            "return await agent('bad', { isolation: 'logical-realm' });",
+            "return await agent('bad', { isolation: 'none' });",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(invalid))) { error in
+                guard case WorkflowScriptAnalysisError.unsupportedConstruct = error else {
+                    return XCTFail("Expected agent option rejection, got \(error)")
+                }
+            }
+        }
+        let finalSnapshot = await recorder.snapshot()
+        XCTAssertEqual(finalSnapshot.prompts, ["structured"])
+    }
+
+    func testStepCollectionAndRuntimeCapabilityLimitsFailClosed() async throws {
+        let loop = try analyze(wrapped("let i = 0; while (true) { i += 1; }"))
+        await XCTAssertThrowsErrorAsync(expected: WorkflowScriptRuntimeError.stepLimitExceeded) {
+            _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                loop,
+                args: nil,
+                limits: try self.limits(maximumScriptSteps: 64),
+                requirement: .init(),
+                host: WorkflowScriptHost(agent: { _ in .stopped })
+            )
+        }
+
+        let collection = try analyze(wrapped("return await parallel([() => 1, () => 2, () => 3]);"))
+        await XCTAssertThrowsErrorAsync {
+            _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                collection,
+                args: nil,
+                limits: try self.limits(maximumCollectionItems: 2),
+                requirement: .init(),
+                host: WorkflowScriptHost(agent: { _ in .stopped })
+            )
+        }
+
+        await XCTAssertThrowsErrorAsync(expected: WorkflowScriptRuntimeError.unsupportedRequirement) {
+            _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                collection,
+                args: nil,
+                limits: try self.limits(),
+                requirement: .init(minimumIsolation: .hardenedSandbox),
+                host: WorkflowScriptHost(agent: { _ in .stopped })
+            )
+        }
+    }
+
+    func testArgumentsAreDeepFrozenAndFinalValuesMustBeJSON() async throws {
+        let frozen = try analyze(wrapped("""
+        let rejected = false;
+        try { args.profile.name = 'changed'; } catch (_) { rejected = true; }
+        return { rejected, name: args.profile.name };
+        """))
+        let args = try CanonicalJSON(.object([
+            "profile": .object(["name": .string("Dong")])
+        ]))
+        let result = try await JavaScriptCoreWorkflowRuntime().execute(
+            frozen,
+            args: args,
+            limits: try limits(),
+            requirement: .init(),
+            host: WorkflowScriptHost(agent: { _ in .stopped })
+        )
+        XCTAssertEqual(try decode(result), .object(["rejected": .bool(true), "name": .string("Dong")]))
+
+        let cyclic = try analyze(wrapped("const value = {}; value.self = value; return value;"))
+        await XCTAssertThrowsErrorAsync {
+            _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                cyclic,
+                args: nil,
+                limits: try self.limits(),
+                requirement: .init(),
+                host: WorkflowScriptHost(agent: { _ in .stopped })
+            )
+        }
+    }
+
+    func testBridgeIntrinsicsCannotBeReachedThroughComputedPropertyNames() throws {
+        for body in [
+            "Promise['pro' + 'totype'].then = () => 1; return 'escaped';",
+            "Map['pro' + 'totype'].get = () => null; return 'escaped';",
+            "JSON['string' + 'ify'] = () => 'null'; return 'escaped';",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(body))) { error in
+                guard case WorkflowScriptAnalysisError.forbiddenCapability = error else {
+                    return XCTFail("Expected computed intrinsic access rejection, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testUserSourceCannotReferenceOrForgePrivateDriverBindings() async throws {
+        for name in [
+            "__settle", "__pending", "__finishedNative", "__startAgentNative",
+            "__mllmFinished", "__mllmUserFunction", "__workflowCheckpoint",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped("return typeof \(name);")), name) { error in
+                guard case WorkflowScriptAnalysisError.forbiddenCapability = error else {
+                    return XCTFail("Expected private-binding rejection for \(name), got \(error)")
+                }
+            }
+        }
+
+        // Unprefixed lookalikes are not driver capabilities either. The separately compiled user
+        // function has only the public ABI parameters in scope, so it cannot settle or finish early.
+        let recorder = WorkflowInvocationRecorder()
+        let forged = try analyze(wrapped("settle(1, true, 'forged'); return 'forged';"))
+        await XCTAssertThrowsErrorAsync {
+            _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                forged,
+                args: nil,
+                limits: try self.limits(),
+                requirement: .init(),
+                host: WorkflowScriptHost(agent: { invocation in
+                    await recorder.record(prompt: invocation.prompt, options: invocation.options)
+                    return .value(.null)
+                })
+            )
+        }
+        let snapshot = await recorder.snapshot()
+        XCTAssertTrue(snapshot.prompts.isEmpty)
+    }
+
+    func testNonPreemptibleRegularExpressionsAndAmplifyingBuiltinsFailClosedInAnalysis() throws {
+        for body in [
+            "return /^(a+)+$/.test(args.input);",
+            "return new RegExp('^(a+)+$').test(args.input);",
+            "return 'x'.repeat(1000000000);",
+            "return 'x'.padEnd(1000000000, 'x');",
+            "return [1].fill(0, 0, 1000000000);",
+            "return [args, args].join(',');",
+            "return JSON.stringify(args);",
+            "return JSON['stringify'](args);",
+            "return JSON.parse(args.payload);",
+            "return Array.from({ length: 1000000000 });",
+            "return Object.assign({}, args, args);",
+            "return String.fromCharCode(...args.codes);",
+            "return ['x'].concat(args);",
+            "return ({ toJSON: () => 'forged' });",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(body)), body) { error in
+                guard case WorkflowScriptAnalysisError.forbiddenCapability = error else {
+                    return XCTFail("Expected synchronous builtin rejection, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testRejectsUnbracedWhileAfterUnrelatedBlock() throws {
+        for body in ["if (true) {} while (true);", "{} while (true);", "do {} while (false); while (true);"] {
+            XCTAssertThrowsError(try analyze(wrapped(body)))
+        }
+    }
+
+    func testExpressionArrowsAndAsyncMethodsCannotSpinWithoutCheckpoints() async throws {
+        for body in [
+            "const spin = () => Promise.resolve().then(spin); return await spin();",
+            "const obj = { async spin() { await 0; return obj.spin(); } }; return await obj.spin();",
+            "const spin = () => spin(); return spin();",
+            "while ((() => { while (true) {} })()) {}",
+            "do {} while ((() => { while (true) {} })());",
+        ] {
+            let script = try analyze(wrapped(body))
+            await XCTAssertThrowsErrorAsync(expected: WorkflowScriptRuntimeError.stepLimitExceeded) {
+                _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                    script, args: nil, limits: try self.limits(maximumScriptSteps: 32),
+                    requirement: .init(), host: WorkflowScriptHost(agent: { _ in .stopped })
+                )
+            }
+        }
+    }
+
+    private func analyze(_ source: String) throws -> AnalyzedWorkflowScriptV1 {
+        let script = try WorkflowScriptV1(scriptID: WorkflowScriptID(), version: 1, source: source)
+        return try DynamicWorkflowScriptAnalyzer().analyze(script)
+    }
+
+    private func wrapped(_ body: String) -> String {
+        "export const meta = { name: 'runtime-test', description: 'Runtime test' };\n" + body
+    }
+
+    private func limits(
+        maximumCollectionItems: UInt32 = 32,
+        maximumScriptSteps: UInt64 = 10_000
+    ) throws -> WorkflowRunLimitsV1 {
+        try WorkflowRunLimitsV1(
+            maximumConcurrentAgents: 4,
+            maximumAgentCalls: 64,
+            maximumCollectionItems: maximumCollectionItems,
+            maximumWallClockMilliseconds: 5_000,
+            maximumScriptSteps: maximumScriptSteps,
+            maximumLogLines: 100,
+            maximumPhaseEntries: 100,
+            maximumSerializedValueBytes: 1_048_576
+        )
+    }
+
+    private func decode(_ value: CanonicalJSON) throws -> JSONValue {
+        try JSONDecoder().decode(JSONValue.self, from: value.data)
+    }
+}
+
+private actor WorkflowInvocationRecorder {
+    struct Snapshot: Sendable {
+        let prompts: [String]
+        let starts: [String]
+        let options: [WorkflowAgentOptionsV1]
+        let phases: [String]
+        let logs: [String]
+        let maximumActive: Int
+    }
+
+    private let delays: [String: UInt64]
+    private var prompts: [String] = []
+    private var starts: [String] = []
+    private var options: [WorkflowAgentOptionsV1] = []
+    private var phases: [String] = []
+    private var logs: [String] = []
+    private var active = 0
+    private var maximumActive = 0
+
+    init(delays: [String: UInt64] = [:]) { self.delays = delays }
+
+    func record(prompt: String, options: WorkflowAgentOptionsV1) {
+        prompts.append(prompt)
+        starts.append(prompt)
+        self.options.append(options)
+    }
+
+    func record(phase: String) { phases.append(phase) }
+    func record(log: String) { logs.append(log) }
+
+    func execute(prompt: String, options: WorkflowAgentOptionsV1) async throws -> WorkflowAgentBridgeResult {
+        prompts.append(prompt)
+        starts.append(prompt)
+        self.options.append(options)
+        active += 1
+        maximumActive = max(maximumActive, active)
+        if let delay = delays[prompt] { try await Task.sleep(nanoseconds: delay) }
+        active -= 1
+        if prompt == "missing" { return .unavailable("not found") }
+        return .value(.string(prompt))
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            prompts: prompts,
+            starts: starts,
+            options: options,
+            phases: phases,
+            logs: logs,
+            maximumActive: maximumActive
+        )
+    }
+}
+
+private func XCTAssertThrowsErrorAsync<T>(
+    expected: WorkflowScriptRuntimeError? = nil,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ body: () async throws -> T
+) async {
+    do {
+        _ = try await body()
+        XCTFail("Expected an error", file: file, line: line)
+    } catch {
+        if let expected { XCTAssertEqual(error as? WorkflowScriptRuntimeError, expected, file: file, line: line) }
+    }
+}

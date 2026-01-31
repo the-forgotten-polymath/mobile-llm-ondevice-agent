@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: MIT
+
+import Foundation
+import LLMCore
+import AgentContracts
+import AgentRuntime
+
+/// One message in a conversation (DESIGN §2.4). Reasoning + answer are stored split so the thinking
+/// disclosure can re-render a completed turn exactly as it streamed. `parentID` is plumbed for the
+/// v1.0 edit/branch pager (the pager UI itself is deferred).
+/// A tool the assistant invoked during a turn — its name, a short argument summary, and the result once
+/// it returns (nil while running). Shown as an activity row and persisted with the message.
+public struct ToolRun: Identifiable, Codable, Sendable, Equatable {
+    public var id: UUID
+    public var name: String
+    public var arguments: String
+    public var result: String?
+    public init(id: UUID = UUID(), name: String, arguments: String, result: String? = nil) {
+        self.id = id; self.name = name; self.arguments = arguments; self.result = result
+    }
+}
+
+/// A reference to one image the user attached to a turn. The bytes live as a FILE
+/// (`attachments/<id>.jpg` under the conversation store root, written/deleted by `ConversationStore`),
+/// never inlined into the conversation JSON — so a multi-MB photo doesn't bloat every record load, and a
+/// hard-delete purges the pixels with the thread (the privacy promise, DESIGN §2.4).
+public struct ImageRef: Identifiable, Codable, Sendable, Equatable {
+    public let id: UUID
+    public init(id: UUID = UUID()) { self.id = id }
+    /// The on-disk filename under the store's `attachments/` directory.
+    public var fileName: String { "\(id.uuidString).jpg" }
+}
+
+/// A durable snapshot of the model that generated one assistant turn. Conversation-level model identity
+/// tracks only the thread's current selection, so it cannot label historical generation stats after a model
+/// switch. IDs preserve machine identity; `displayName` keeps the footer meaningful if a catalog entry is
+/// later renamed or removed.
+public struct GenerationModel: Codable, Sendable, Equatable {
+    public var modelID: String
+    public var variantID: String
+    public var displayName: String
+    public var engine: EngineKind
+
+    public init(modelID: String, variantID: String, displayName: String, engine: EngineKind) {
+        self.modelID = modelID
+        self.variantID = variantID
+        self.displayName = displayName
+        self.engine = engine
+    }
+
+    public init(_ loaded: LoadedModel) {
+        self.init(modelID: loaded.model.id, variantID: loaded.variant.id,
+                  displayName: loaded.model.displayName, engine: loaded.variant.engine)
+    }
+}
+
+public struct Message: Identifiable, Codable, Sendable, Equatable {
+    public enum Role: String, Codable, Sendable, Equatable {
+        case system, user, assistant
+    }
+
+    /// Why an assistant turn ended with no answer text — the user tapped Stop, or generation errored.
+    /// Drives the compact "Stopped / Failed — Retry" row instead of a ghost "0 tok" stats line. Optional
+    /// → older records (and every normal turn) decode as nil.
+    /// Why a committed turn has no text. `stopped` = the user stopped it; `noReply` = the model ended
+    /// its turn having produced nothing (a real small-model outcome — labelling that "Stopped" blamed the
+    /// user for the model's silence); `failed` = generation threw.
+    public enum EmptyOutcome: String, Codable, Sendable, Equatable { case stopped, noReply, failed }
+
+    public let id: UUID
+    public var role: Role
+    public var createdAt: Date
+    /// The visible answer text (everything outside `<think>`).
+    public var answer: String
+    /// The `<think>` reasoning, if the turn produced any (nil for user/system turns).
+    public var reasoning: String?
+    /// Set when an assistant turn committed with an empty answer (interrupted before the first token or
+    /// failed). nil for every turn that produced text.
+    public var emptyOutcome: EmptyOutcome?
+    /// Wall-clock the model spent inside its `<think>` block, persisted so the collapsed reasoning tile
+    /// shows an honest "Thought for Xs" (optional → old records without it decode as nil).
+    public var thinkingSeconds: Double?
+    /// Tools the assistant called during this turn (empty/absent for non-tool turns; optional → old
+    /// records decode as nil).
+    public var toolRuns: [ToolRun]?
+    /// End-of-generation stats for an assistant turn (nil while streaming / for non-assistant turns).
+    public var stats: Stats?
+    /// The exact model/variant that generated this assistant turn. Optional so conversations written by
+    /// older app versions decode without migration; an absent value is rendered as an unknown model rather
+    /// than incorrectly borrowing the thread's current selection.
+    public var generatedBy: GenerationModel?
+    /// The turn this message was branched/regenerated from (v1.0 branch pager).
+    public var parentID: UUID?
+    /// Images the user attached to this turn, as file references (bytes live under the store's
+    /// `attachments/` dir — never inline here). Optional → old records without the key decode as nil,
+    /// and a text-only turn re-encodes byte-identically (the synthesized Codable omits a nil key).
+    public var attachments: [ImageRef]?
+    /// Message-anchored workflow record (spec §20/§23): the initiating message owns the live and
+    /// completed workflow row. Optional → old records decode without one.
+    public var workflowRecord: WorkflowMessageRecord?
+    /// Stable provenance for a workflow's projected final answer. This persisted identity, rather
+    /// than an in-memory map or answer-text heuristic, enforces exactly-once projection on relaunch.
+    public var workflowResultID: UUID?
+
+    public init(id: UUID = UUID(), role: Role, createdAt: Date = Date(),
+                answer: String, reasoning: String? = nil, thinkingSeconds: Double? = nil,
+                toolRuns: [ToolRun]? = nil, stats: Stats? = nil, parentID: UUID? = nil,
+                emptyOutcome: EmptyOutcome? = nil, attachments: [ImageRef]? = nil,
+                generatedBy: GenerationModel? = nil,
+                workflowRecord: WorkflowMessageRecord? = nil,
+                workflowResultID: UUID? = nil) {
+        self.id = id
+        self.role = role
+        self.createdAt = createdAt
+        self.answer = answer
+        self.reasoning = reasoning
+        self.thinkingSeconds = thinkingSeconds
+        self.toolRuns = toolRuns
+        self.stats = stats
+        self.generatedBy = generatedBy
+        self.parentID = parentID
+        self.emptyOutcome = emptyOutcome
+        self.attachments = attachments
+        self.workflowRecord = workflowRecord
+        self.workflowResultID = workflowResultID
+    }
+
+    /// A CJK-aware token estimate (`LLMCore.TokenEstimate`) used for context-window trimming — the old
+    /// `count / 4` under-counted Chinese/Japanese/Korean ~3× and let the window silently overrun.
+    var approximateTokens: Int { TokenEstimate.tokens(in: answer) }
+
+    /// Whether this turn carries anything the engine should see — visible text OR image attachments. A
+    /// user turn with only an image (no text) still counts; an empty assistant placeholder does not.
+    var hasVisibleContent: Bool { !answer.isEmpty || !(attachments?.isEmpty ?? true) }
+}
+
+/// A chat thread (DESIGN §2.4). Persisted one-record-per-file by `ConversationStore`; a lightweight
+/// `ConversationIndexEntry` mirrors it in `index.json` for fast list rendering.
+/// Per-thread sampling overrides: a nil field means "follow the global Settings value".
+public struct ConversationSampling: Codable, Sendable, Equatable {
+    public var temperature: Double?
+    public var topP: Double?
+    public var maxTokens: Int?
+
+    public init(temperature: Double? = nil, topP: Double? = nil, maxTokens: Int? = nil) {
+        self.temperature = temperature
+        self.topP = topP
+        self.maxTokens = maxTokens
+    }
+}
+
+public struct Conversation: Identifiable, Codable, Sendable, Equatable {
+    public let id: UUID
+    public var title: String
+    public let createdAt: Date
+    public var updatedAt: Date
+    /// Optional reference to a named system prompt; MVP threads inline the system prompt from Settings.
+    public var systemPromptID: String?
+    public var modelID: String
+    /// The variant's Hugging Face repo id (`LLMVariant.id`).
+    public var variantID: String
+    public var messages: [Message]
+    public var pinned: Bool
+    /// The skill activated for this thread (Skills v1), if any. Its instructions ride the system prompt on
+    /// every turn (`ChatStore.systemPrompt(base:skill:)`). Optional → old records without the key decode as
+    /// nil, and a skill-less thread re-encodes byte-identically (the synthesized Codable omits a nil key,
+    /// exactly like `Message.attachments`).
+    public var skillID: UUID?
+    /// The conversation-persistent tool policy (spec §14). Optional so pre-agent records decode as
+    /// nil; a legacy conversation materializes the current global template exactly once on its first
+    /// agent-runtime run, then persists the marker.
+    public var toolPolicy: ConversationToolPolicy?
+    /// Per-thread override for ONLINE service reasoning (nil = follow the service's "Allow reasoning"
+    /// setting). Synthesized Codable decodes a missing key as nil, so old records are unaffected.
+    public var onlineReasoningEnabled: Bool?
+    /// Per-thread context-window override in tokens (nil = follow the app's global setting — the
+    /// local `contextLength` or the online `onlineContextLength`). Missing key decodes as nil.
+    public var contextLength: Int?
+    /// Per-thread sampling overrides (nil = follow global Settings). Missing key decodes as nil.
+    public var sampling: ConversationSampling?
+    /// Per-thread approval-mode override (nil = follow the product default Safe preset). Adjustable
+    /// at any time from the composer menu; frozen into each run. Missing key decodes as nil.
+    public var approvalMode: AgentApprovalMode?
+    /// Per-thread reasoning effort (nil = `.medium`). Applies when reasoning is enabled. Missing key
+    /// decodes as nil.
+    public var reasoningEffort: ReasoningEffort?
+    /// Pure tag grouping for this conversation (spec §20 "Project"): a conversation may belong to any
+    /// number of tags, and tags are shared across conversations. Optional → old records decode as nil.
+    public var projectTags: [String]?
+
+    public init(id: UUID = UUID(), title: String = "New Chat", createdAt: Date = Date(),
+                updatedAt: Date = Date(), systemPromptID: String? = nil, modelID: String,
+                variantID: String, messages: [Message] = [], pinned: Bool = false,
+                skillID: UUID? = nil, toolPolicy: ConversationToolPolicy? = nil,
+                onlineReasoningEnabled: Bool? = nil, contextLength: Int? = nil,
+                sampling: ConversationSampling? = nil,
+                approvalMode: AgentApprovalMode? = nil,
+                reasoningEffort: ReasoningEffort? = nil,
+                projectTags: [String]? = nil) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.systemPromptID = systemPromptID
+        self.modelID = modelID
+        self.variantID = variantID
+        self.messages = messages
+        self.pinned = pinned
+        self.skillID = skillID
+        self.toolPolicy = toolPolicy
+        self.onlineReasoningEnabled = onlineReasoningEnabled
+        self.contextLength = contextLength
+        self.sampling = sampling
+        self.approvalMode = approvalMode
+        self.reasoningEffort = reasoningEffort
+        self.projectTags = projectTags
+    }
+
+    /// The conversation's project tags (empty when none are stored).
+    public var projectTagList: [String] { projectTags ?? [] }
+
+    /// A one-line preview for the conversation list (last user or assistant text).
+    public var preview: String {
+        for message in messages.reversed() where message.role != .system && !message.answer.isEmpty {
+            return message.answer
+        }
+        return "No messages yet"
+    }
+
+    /// The index projection used for cheap list rendering + persistence consistency.
+    var indexEntry: ConversationIndexEntry {
+        ConversationIndexEntry(id: id, title: title, createdAt: createdAt, updatedAt: updatedAt,
+                               modelID: modelID, messageCount: messages.count, pinned: pinned)
+    }
+}
+
+/// The lightweight per-thread record kept in `index.json` so the list renders without loading every
+/// full conversation file (DESIGN §2.4). `deletedAt` is the soft-delete tombstone.
+public struct ConversationIndexEntry: Identifiable, Codable, Sendable, Equatable {
+    public let id: UUID
+    public var title: String
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var modelID: String
+    public var messageCount: Int
+    public var pinned: Bool
+    /// Set when the thread is soft-deleted; the underlying file is kept so the delete can be undone.
+    public var deletedAt: Date?
+
+    public init(id: UUID, title: String, createdAt: Date, updatedAt: Date, modelID: String,
+                messageCount: Int, pinned: Bool, deletedAt: Date? = nil) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.modelID = modelID
+        self.messageCount = messageCount
+        self.pinned = pinned
+        self.deletedAt = deletedAt
+    }
+
+    public var isDeleted: Bool { deletedAt != nil }
+}
