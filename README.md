@@ -59,3 +59,5 @@ Refer to repository package specifications to run locally.
 ## 📄 License
 
 This project is licensed under the **MIT License**.
+
+<!-- Feature branch enhancement: feat/mlx-kv-cache-quantization -->
